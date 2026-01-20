@@ -17,9 +17,17 @@ def setup_logging(level: str = "INFO"):
 
 def save_json(data: Any, filepath: str):
     """Save data to JSON file"""
+    from datetime import datetime
+    
+    def json_serial(obj):
+        """JSON serializer for objects not serializable by default json code"""
+        if isinstance(obj, datetime):
+            return obj.isoformat()
+        raise TypeError(f"Type {type(obj)} not serializable")
+    
     Path(filepath).parent.mkdir(parents=True, exist_ok=True)
     with open(filepath, 'w', encoding='utf-8') as f:
-        json.dump(data, f, indent=2, ensure_ascii=False)
+        json.dump(data, f, indent=2, ensure_ascii=False, default=json_serial)
     logging.info(f"Saved data to {filepath}")
 
 def load_json(filepath: str) -> Any:
