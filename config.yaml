@@ -1,0 +1,56 @@
+# Social Media Automation Configuration
+
+# RSS Feeds for AI/ML Tech Blogs
+rss_feeds:
+  - name: "TechCrunch AI"
+    url: "https://techcrunch.com/category/artificial-intelligence/feed/"
+  - name: "VentureBeat AI"
+    url: "https://venturebeat.com/category/ai/feed/"
+  - name: "The Verge AI"
+    url: "https://www.theverge.com/ai-artificial-intelligence/rss/index.xml"
+  - name: "MIT Technology Review AI"
+    url: "https://www.technologyreview.com/topic/artificial-intelligence/feed"
+  - name: "Wired AI"
+    url: "https://www.wired.com/feed/tag/ai/latest/rss"
+
+# Keywords for filtering AI/ML articles
+article_keywords:
+  - artificial intelligence
+  - machine learning
+  - deep learning
+  - neural network
+  - llm
+  - large language model
+  - gpt
+  - claude
+  - openai
+  - anthropic
+  - generative ai
+  - ai model
+  - transformer
+  - nlp
+  - computer vision
+
+# Article fetching settings
+article_settings:
+  max_articles_per_feed: 20
+  top_articles_count: 10
+  min_article_age_hours: 1
+  max_article_age_days: 7
+
+# Post generation settings
+post_settings:
+  max_length: 500
+  default_count: 5
+  temperature: 0.7
+  
+# Comment generation settings
+comment_settings:
+  max_length: 300
+  temperature: 0.7
+  
+# Logging
+logging:
+  level: INFO
+  format: "%(asctime)s - %(name)s - %(levelname)s - %(message)s"
+
