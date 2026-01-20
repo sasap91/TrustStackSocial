@@ -2,7 +2,7 @@
 Mastodon API client for posting social media content
 """
 import logging
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 from mastodon import Mastodon
 
 logger = logging.getLogger(__name__)
@@ -191,4 +191,122 @@ class MastodonClient:
         except Exception as e:
             logger.error(f"Error deleting status: {e}")
             return False
+    
+    def search_posts(
+        self,
+        query: str,
+        limit: int = 5,
+        account_id: Optional[str] = None
+    ) -> List[Dict[str, Any]]:
+        """
+        Search for posts on Mastodon using hashtag timeline
+        
+        Args:
+            query: Hashtag to search for (without #)
+            limit: Maximum number of results
+            account_id: Optional account ID to exclude own posts
+            
+        Returns:
+            List of matching posts
+        """
+        try:
+            # Convert query to hashtag (remove spaces, special chars)
+            hashtag = query.replace(' ', '').replace('#', '')
+            
+            logger.info(f"Searching Mastodon hashtag: #{hashtag}")
+            
+            # Try to get hashtag timeline (doesn't require special permissions)
+            try:
+                statuses = self.client.timeline_hashtag(
+                    hashtag,
+                    limit=limit * 3  # Get more to filter
+                )
+            except:
+                # Fallback: try public timeline and filter
+                logger.info("Hashtag search failed, trying public timeline")
+                statuses = self.client.timeline_public(limit=40)
+            
+            posts = []
+            keywords = query.lower().split()
+            
+            for status in statuses:
+                # Skip own posts if account_id provided
+                if account_id and status['account']['id'] == account_id:
+                    continue
+                
+                # Skip replies to avoid threading issues
+                if status.get('in_reply_to_id'):
+                    continue
+                
+                # Check if post content matches keywords
+                content_lower = status.get('content', '').lower()
+                if not any(keyword in content_lower for keyword in keywords):
+                    # Also check hashtags
+                    post_tags = [tag.get('name', '').lower() for tag in status.get('tags', [])]
+                    if not any(keyword in tag for keyword in keywords for tag in post_tags):
+                        continue
+                
+                posts.append({
+                    'id': status['id'],
+                    'content': status['content'],
+                    'url': status['url'],
+                    'created_at': status['created_at'].isoformat() if hasattr(status['created_at'], 'isoformat') else str(status['created_at']),
+                    'account': {
+                        'username': status['account']['username'],
+                        'display_name': status['account']['display_name'],
+                        'url': status['account']['url']
+                    },
+                    'favourites_count': status.get('favourites_count', 0),
+                    'reblogs_count': status.get('reblogs_count', 0),
+                    'replies_count': status.get('replies_count', 0)
+                })
+                
+                if len(posts) >= limit:
+                    break
+            
+            logger.info(f"Found {len(posts)} relevant posts")
+            return posts
+            
+        except Exception as e:
+            logger.error(f"Error searching Mastodon: {e}")
+            return []
+    
+    def reply_to_status(
+        self,
+        status_id: str,
+        reply_content: str,
+        visibility: str = "public"
+    ) -> Dict[str, Any]:
+        """
+        Reply to a specific status
+        
+        Args:
+            status_id: ID of status to reply to
+            reply_content: Reply content
+            visibility: Visibility setting
+            
+        Returns:
+            Posted reply information
+        """
+        try:
+            logger.info(f"Replying to status {status_id}")
+            
+            status = self.client.status_post(
+                status=reply_content,
+                in_reply_to_id=status_id,
+                visibility=visibility
+            )
+            
+            logger.info(f"Successfully replied. Reply ID: {status['id']}")
+            
+            return {
+                'id': status['id'],
+                'url': status['url'],
+                'created_at': status['created_at'].isoformat(),
+                'in_reply_to_id': status_id
+            }
+            
+        except Exception as e:
+            logger.error(f"Error replying to status: {e}")
+            raise
 

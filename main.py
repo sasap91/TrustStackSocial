@@ -19,6 +19,7 @@ from src.post_generator import PostGenerator
 from src.mastodon_client import MastodonClient
 from src.article_fetcher import ArticleFetcher
 from src.comment_generator import CommentGenerator
+from src.reply_generator import ReplyGenerator
 
 # Setup logging
 setup_logging()
@@ -385,6 +386,126 @@ def account_info(ctx):
     click.echo(f"  Following: {info['following_count']}")
     click.echo(f"  Posts: {info['statuses_count']}")
     click.echo(f"  URL: {info['url']}")
+
+
+@cli.command()
+@click.option('--keyword', '-k', help='Keyword to search for (defaults to business-related terms)')
+@click.option('--count', '-c', default=5, help='Number of posts to find')
+@click.option('--output', '-o', default='output/replies.json', help='Output file path')
+@click.option('--post-replies', is_flag=True, help='Actually post the replies to Mastodon')
+@click.pass_context
+def search_and_reply(ctx, keyword, count, output, post_replies):
+    """Search for relevant posts and generate replies using structured outputs"""
+    config = ctx.obj['config']
+    
+    # Default keywords if not provided
+    if not keyword:
+        keywords = ['ecommerce fraud', 'marketplace safety', 'trust and safety', 'payment fraud', 'account takeover']
+        keyword = keywords[0]  # Use first one
+        click.echo(f"Using default keyword: {keyword}")
+    
+    click.echo(f"\nSearching Mastodon for: '{keyword}'")
+    click.echo(f"Looking for {count} recent posts...")
+    
+    # Initialize clients
+    mastodon_client = MastodonClient(
+        config.mastodon_access_token,
+        config.mastodon_api_base_url
+    )
+    
+    # Get account info to filter out own posts
+    account_info = mastodon_client.get_account_info()
+    account_id = account_info['id']
+    
+    # Search for posts
+    posts = mastodon_client.search_posts(
+        query=keyword,
+        limit=count,
+        account_id=account_id
+    )
+    
+    if not posts:
+        click.echo("\n✗ No relevant posts found. Try a different keyword.")
+        return
+    
+    click.echo(f"\n✓ Found {len(posts)} posts")
+    
+    # Display found posts
+    click.echo("\nPosts found:")
+    for i, post in enumerate(posts, 1):
+        click.echo(f"\n{i}. @{post['account']['username']}")
+        click.echo(f"   {post['content'][:100]}...")
+        click.echo(f"   URL: {post['url']}")
+    
+    # Initialize AI clients
+    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
+    
+    # Generate replies using structured outputs
+    click.echo(f"\n🤖 Generating replies using AI structured outputs...")
+    
+    reply_generator = ReplyGenerator(openrouter_client, notion_client, max_length=500)
+    
+    posts_with_replies = reply_generator.generate_replies_batch(
+        posts=posts,
+        temperature=0.7
+    )
+    
+    # Save to file
+    save_json(posts_with_replies, output)
+    click.echo(f"\n✓ Saved replies to {output}")
+    
+    # Display generated replies
+    click.echo("\n" + "="*60)
+    click.echo("Generated Replies:")
+    click.echo("="*60)
+    
+    replies_to_post = []
+    for i, item in enumerate(posts_with_replies, 1):
+        click.echo(f"\n--- Post {i} ---")
+        click.echo(f"Author: @{item['account']['username']}")
+        click.echo(f"Original: {item['content'][:80]}...")
+        click.echo(f"Should Reply: {'✓ YES' if item.get('should_reply') else '✗ NO'}")
+        click.echo(f"Reason: {item.get('reason', 'N/A')}")
+        
+        if item.get('should_reply') and item.get('reply'):
+            click.echo(f"\nReply ({item['reply_length']} chars):")
+            click.echo(f"  {item['reply']}")
+            replies_to_post.append(item)
+    
+    # Post replies if requested
+    if post_replies and replies_to_post:
+        click.echo(f"\n" + "="*60)
+        click.echo(f"Posting {len(replies_to_post)} replies to Mastodon...")
+        click.echo("="*60)
+        
+        for i, item in enumerate(replies_to_post, 1):
+            try:
+                click.echo(f"\n[{i}/{len(replies_to_post)}] Replying to @{item['account']['username']}...")
+                
+                result = mastodon_client.reply_to_status(
+                    status_id=item['id'],
+                    reply_content=item['reply'],
+                    visibility='public'
+                )
+                
+                click.echo(f"  ✓ Posted: {result['url']}")
+                
+                # Brief pause between replies
+                import time
+                if i < len(replies_to_post):
+                    time.sleep(2)
+                
+            except Exception as e:
+                click.echo(f"  ✗ Error: {e}", err=True)
+        
+        click.echo(f"\n✓ Posted {len(replies_to_post)} replies!")
+    
+    elif not post_replies:
+        click.echo(f"\n💡 To actually post these replies, run with --post-replies flag")
+    
+    else:
+        click.echo(f"\n✗ No relevant posts to reply to")
 
 
 if __name__ == '__main__':
