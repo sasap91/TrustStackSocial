@@ -2,11 +2,71 @@
 Notion API client for fetching company information
 """
 import logging
-from typing import Dict, Any, Optional
+import socket
+import subprocess
+import re
+from typing import Dict, Any, Optional, Tuple, List
+import httpx
 from notion_client import Client
 from notion_client.errors import APIResponseError
 
 logger = logging.getLogger(__name__)
+
+# Ensure IPv4 is forced at socket level (in case main.py hasn't patched yet)
+socket.has_ipv6 = False
+
+# Patch socket.getaddrinfo to add nslookup fallback
+# Store whatever getaddrinfo is currently (might be patched by main.py)
+_current_getaddrinfo = socket.getaddrinfo
+
+def getaddrinfo_ipv4(*args, **kwargs):
+    """Force IPv4-only DNS resolution with nslookup fallback"""
+    # Remove IPv6 family if specified
+    if len(args) >= 3:
+        family = args[2]
+        if family == socket.AF_UNSPEC:
+            family = socket.AF_INET
+        elif family == socket.AF_INET6:
+            family = socket.AF_INET
+        args = list(args)
+        args[2] = family
+        args = tuple(args)
+    else:
+        # Default to IPv4
+        kwargs['family'] = socket.AF_INET
+    
+    try:
+        return _current_getaddrinfo(*args, **kwargs)
+    except socket.gaierror as e:
+        # If DNS fails, try nslookup as fallback
+        if len(args) >= 1:
+            host = args[0]
+            port = args[1] if len(args) >= 2 else 0
+            
+            # Try nslookup as fallback
+            try:
+                result = subprocess.run(
+                    ['nslookup', host],
+                    capture_output=True,
+                    text=True,
+                    timeout=5
+                )
+                if result.returncode == 0:
+                    # Parse nslookup output to extract IP addresses
+                    ip_pattern = r'Address:\s*(\d+\.\d+\.\d+\.\d+)'
+                    matches = re.findall(ip_pattern, result.stdout)
+                    if matches:
+                        ip = matches[0]
+                        logger.info(f"Resolved {host} to {ip} via nslookup fallback")
+                        return [(socket.AF_INET, socket.SOCK_STREAM, 6, '', (ip, port))]
+            except Exception as fallback_error:
+                logger.debug(f"nslookup fallback failed: {fallback_error}")
+        
+        # Re-raise the original error if fallback fails
+        raise
+
+# Apply the patch
+socket.getaddrinfo = getaddrinfo_ipv4
 
 
 class NotionClient:
@@ -20,7 +80,22 @@ class NotionClient:
             api_key: Notion API key
             page_id: Notion page ID containing company information
         """
-        self.client = Client(auth=api_key)
+        # Fix 2: Force IPv4
+        socket.has_ipv6 = False
+        
+        # Fix 1: Create explicit httpx client with trust_env=False to disable proxy inheritance
+        transport = httpx.HTTPTransport(retries=3)
+        http_client = httpx.Client(
+            transport=transport,
+            trust_env=False,  # Disables proxy inheritance and DNS overrides
+            timeout=30.0,
+            http2=False  # Force HTTP/1.1 (macOS security stacks can block HTTP/2)
+        )
+        
+        self.client = Client(
+            auth=api_key,
+            client=http_client
+        )
         self.page_id = page_id
         self._cached_content = None
     
@@ -40,6 +115,9 @@ class NotionClient:
         
         try:
             logger.info(f"Fetching Notion page: {self.page_id}")
+            
+            # Fix 3: Debug output for API host
+            logger.debug("NOTION BASE HOST: api.notion.com")
             
             # Fetch page
             page = self.client.pages.retrieve(page_id=self.page_id)

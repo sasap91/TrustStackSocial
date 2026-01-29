@@ -13,7 +13,8 @@ rss_feeds:
   - name: "Wired AI"
     url: "https://www.wired.com/feed/tag/ai/latest/rss"
 
-# Keywords for filtering AI/ML articles
+# Keywords for filtering articles (AI/ML and TrustStack-relevant: trust, safety, policy)
+# These drive which "latest news" are combined into the post and (optionally) the comic topic
 article_keywords:
   - artificial intelligence
   - machine learning
@@ -30,6 +31,11 @@ article_keywords:
   - transformer
   - nlp
   - computer vision
+  - trust and safety
+  - content moderation
+  - safety
+  - policy
+  - trust
 
 # Article fetching settings
 article_settings:
@@ -48,6 +54,40 @@ post_settings:
 comment_settings:
   max_length: 300
   temperature: 0.7
+  
+# Logo configuration
+logos:
+  directory: "assets/logos"
+  default_logo: "truststack_logo.png"
+  style_mapping:
+    professional: "truststack_logo.png"
+    casual: "truststack_logo.png"
+    technical: "truststack_logo.png"
+    inspirational: "truststack_logo.png"
+    educational: "truststack_logo.png"
+
+# Telegram bot configuration
+telegram:
+  bot_token: ""  # From environment variable (TELEGRAM_BOT_TOKEN)
+  approval_chat_id: ""  # Chat ID for approvals (TELEGRAM_CHAT_ID)
+  approval_timeout_hours: 24
+
+# Post generation with news
+post_generation:
+  include_news: true
+  max_articles_per_post: 3
+  news_integration_mode: "context_and_quotes"  # Use news as context AND include quotes
+
+# Image generation with Replicate
+image_generation:
+  enabled: true
+  replicate_model: "sundai-club/truststacksocial:b897202db67596183259c5dfaa424ddeb898cc5923934fe8afdd8e096c721517"
+  trigger_word: "truststack"
+  model_type: "schnell"  # Use schnell for faster generation
+  num_inference_steps: 4
+  guidance_scale: 7.5
+  image_directory: "assets/generated_images"
+  style_suffix: "cartoonish style, pastel colors"  # Consistent comic style
   
 # Logging
 logging:

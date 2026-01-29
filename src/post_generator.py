@@ -4,6 +4,7 @@ Social media post generator using Openrouter and Notion
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from sqlalchemy.orm import Session
 
 from .notion_client import NotionClient
 from .openrouter_client import OpenrouterClient
@@ -38,7 +39,8 @@ class PostGenerator:
         self,
         count: int = 5,
         styles: Optional[List[str]] = None,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        db_session: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """
         Generate multiple social media posts
@@ -91,9 +93,34 @@ class PostGenerator:
                 posts.append(post)
                 logger.info(f"Generated post {i+1}: {len(post_content)} chars")
                 
+                # Save to database if session provided
+                if db_session:
+                    try:
+                        from .database import Post
+                        db_post = Post(
+                            content=post_content,
+                            style=style,
+                            length=len(post_content),
+                            generated_at=datetime.fromisoformat(post['generated_at']),
+                            posted=False
+                        )
+                        db_session.add(db_post)
+                        db_session.flush()
+                        post['db_id'] = db_post.id
+                    except Exception as e:
+                        logger.warning(f"Failed to save post to database: {e}")
+                
             except Exception as e:
                 logger.error(f"Error generating post {i+1}: {e}")
                 continue
+        
+        # Commit database changes if session provided
+        if db_session:
+            try:
+                db_session.commit()
+            except Exception as e:
+                logger.warning(f"Failed to commit posts to database: {e}")
+                db_session.rollback()
         
         logger.info(f"Successfully generated {len(posts)} posts")
         return posts

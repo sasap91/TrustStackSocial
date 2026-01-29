@@ -2,10 +2,16 @@
 Mastodon API client for posting social media content
 """
 import logging
+import os
+import tempfile
+from pathlib import Path
 from typing import Dict, Any, Optional, List
 from mastodon import Mastodon
 
 logger = logging.getLogger(__name__)
+
+# Project root for resolving relative image paths (e.g. when approval runs from another cwd)
+APP_ROOT = Path(__file__).resolve().parent.parent
 
 
 class MastodonClient:
@@ -29,13 +35,13 @@ class MastodonClient:
         
         logger.info(f"Initialized Mastodon client for {api_base_url}")
         
-        # Verify credentials
+        # Verify credentials (non-blocking - will fail gracefully if network unavailable)
         try:
             account = self.client.account_verify_credentials()
             logger.info(f"Logged in as: @{account['username']}")
         except Exception as e:
-            logger.error(f"Failed to verify Mastodon credentials: {e}")
-            raise
+            logger.warning(f"Could not verify Mastodon credentials (network may be unavailable): {e}")
+            logger.info("Continuing anyway - credentials will be verified when posting")
     
     def post(
         self,
@@ -308,5 +314,127 @@ class MastodonClient:
             
         except Exception as e:
             logger.error(f"Error replying to status: {e}")
+            raise
+    
+    def post_with_media(
+        self,
+        content: str,
+        image_paths: List[str],
+        visibility: str = "public",
+        sensitive: bool = False,
+        spoiler_text: Optional[str] = None,
+        image_descriptions: Optional[List[str]] = None
+    ) -> Dict[str, Any]:
+        """
+        Post content to Mastodon with images
+        
+        Args:
+            content: Post content
+            image_paths: List of paths to image files
+            visibility: Visibility setting (public, unlisted, private, direct)
+            sensitive: Mark as sensitive content
+            spoiler_text: Content warning text
+            image_descriptions: Optional list of alt text descriptions for images
+            
+        Returns:
+            Posted status information
+        """
+        try:
+            # Resolve relative paths to absolute so approval works from any cwd (e.g. telegram_bot_server)
+            resolved_paths = []
+            for raw_path in image_paths:
+                p = Path(raw_path)
+                if not p.is_absolute():
+                    p = APP_ROOT / raw_path
+                if not p.exists():
+                    logger.warning("Image path does not exist, skipping: %s", p)
+                    continue
+                resolved_paths.append(str(p))
+
+            logger.info(f"Posting to Mastodon with {len(resolved_paths)} images ({len(content)} chars)")
+            if len(resolved_paths) < len(image_paths):
+                logger.warning("Resolved %d/%d image paths (some missing)", len(resolved_paths), len(image_paths))
+
+            # Upload media files first
+            media_ids = []
+            for i, image_path in enumerate(resolved_paths):
+                try:
+                    description = None
+                    if image_descriptions and i < len(image_descriptions):
+                        description = image_descriptions[i]
+
+                    logger.info(f"Uploading media {i+1}/{len(resolved_paths)}: {image_path}")
+
+                    media = self.client.media_post(
+                        media_file=image_path,
+                        description=description
+                    )
+
+                    media_ids.append(media['id'])
+                    logger.info(f"Uploaded media ID: {media['id']}")
+
+                except Exception as e:
+                    logger.error("Error uploading media %s: %s", image_path, e, exc_info=True)
+                    # WebP fallback: if instance rejects WebP, try converting to PNG and retry
+                    png_path = None
+                    if image_path.lower().endswith(".webp"):
+                        try:
+                            from PIL import Image
+                            with Image.open(image_path) as img:
+                                if img.mode in ("RGBA", "P"):
+                                    img = img.convert("RGB")
+                                png_path = tempfile.NamedTemporaryFile(
+                                    delete=False, suffix=".png"
+                                ).name
+                                img.save(png_path, "PNG")
+                            media = self.client.media_post(
+                                media_file=png_path,
+                                description=description if (image_descriptions and i < len(image_descriptions)) else None,
+                            )
+                            media_ids.append(media["id"])
+                            logger.info("Uploaded media as PNG (WebP fallback): %s", media["id"])
+                        except Exception as e2:
+                            logger.warning("WebP to PNG fallback failed for %s: %s", image_path, e2)
+                        finally:
+                            if png_path and Path(png_path).exists():
+                                try:
+                                    os.unlink(png_path)
+                                except OSError:
+                                    pass
+                    continue
+
+            logger.info("Uploaded %d/%d images", len(media_ids), len(resolved_paths))
+            if not media_ids:
+                paths_log = resolved_paths if len(resolved_paths) <= 5 else resolved_paths[:5] + ["..."]
+                logger.warning(
+                    "No media uploaded successfully (tried %d path(s)): %s. Posting text only.",
+                    len(resolved_paths), paths_log
+                )
+                return self.post(content, visibility, sensitive, spoiler_text)
+            
+            # Post status with media
+            status = self.client.status_post(
+                status=content,
+                media_ids=media_ids,
+                visibility=visibility,
+                sensitive=sensitive,
+                spoiler_text=spoiler_text
+            )
+            
+            logger.info(f"Successfully posted with media. Status ID: {status['id']}")
+            logger.info(f"URL: {status['url']}")
+            
+            return {
+                'id': status['id'],
+                'url': status['url'],
+                'created_at': status['created_at'].isoformat(),
+                'visibility': visibility,
+                'media_count': len(media_ids),
+                'favourites_count': status.get('favourites_count', 0),
+                'reblogs_count': status.get('reblogs_count', 0)
+            }
+            
+        except Exception as e:
+            logger.error(f"Error posting with media to Mastodon: {e}")
             raise
 

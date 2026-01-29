@@ -39,6 +39,13 @@ class Config:
         # Mastodon
         self.mastodon_access_token = os.getenv('MASTODON_ACCESS_TOKEN')
         self.mastodon_api_base_url = os.getenv('MASTODON_API_BASE_URL', 'https://mastodon.social')
+        
+        # Telegram
+        self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        
+        # Replicate
+        self.replicate_api_token = os.getenv('REPLICATE_API_TOKEN')
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value by key"""
@@ -75,6 +82,26 @@ class Config:
     def comment_settings(self) -> Dict[str, Any]:
         """Get comment generation settings"""
         return self.get('comment_settings', {})
+    
+    @property
+    def logo_settings(self) -> Dict[str, Any]:
+        """Get logo configuration"""
+        return self.get('logos', {})
+    
+    @property
+    def telegram_settings(self) -> Dict[str, Any]:
+        """Get Telegram bot configuration"""
+        return self.get('telegram', {})
+    
+    @property
+    def post_generation_settings(self) -> Dict[str, Any]:
+        """Get post generation settings"""
+        return self.get('post_generation', {})
+    
+    @property
+    def image_generation_settings(self) -> Dict[str, Any]:
+        """Get image generation configuration"""
+        return self.get('image_generation', {})
     
     def validate(self) -> list:
         """Validate required configuration values"""

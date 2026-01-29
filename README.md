@@ -7,7 +7,8 @@ A Python-based social media automation system that generates AI-powered content 
 - **AI-Powered Content Generation**: Uses Openrouter (with Claude, GPT, or other LLMs) to generate engaging social media posts
 - **Notion Integration**: Fetches company information from Notion to inform content generation
 - **Mastodon Integration**: Posts content directly to Mastodon with full API support
-- **Article Monitoring**: Fetches top AI/ML articles from major tech blogs via RSS
+- **Article Monitoring**: Fetches top AI/ML articles from major tech blogs via RSS; articles are filtered by `config.yaml` **article_keywords** (e.g. trust and safety, AI, policy) so the latest news is TrustStack-relevant
+- **Comic image**: Optional Replicate comic image per post; when LLM is enabled, the comic topic can be derived from article titles (minimal tokens); otherwise the first article title or a default topic is used
 - **Smart Commenting**: Generates thoughtful, contextual comments on industry articles
 - **Manual Control**: Run workflows on-demand with CLI commands
 - **Review Workflow**: Preview and review all generated content before posting
@@ -79,6 +80,8 @@ A Python-based social media automation system that generates AI-powered content 
    MASTODON_ACCESS_TOKEN=your_mastodon_access_token_here
    MASTODON_API_BASE_URL=https://mastodon.social
    ```
+
+5. **Logos (optional):** To include a company logo in posts, place a logo file in `assets/logos/` (e.g. `truststack_logo.png`). See [LOGO_SETUP.md](LOGO_SETUP.md) if you see "Found 0 logos".
 
 ## Getting API Credentials
 
@@ -335,6 +338,10 @@ MASTODON_ACCESS_TOKEN=...
 1. Check your internet connection
 2. Verify the RSS feed URL is accessible
 3. Some feeds may be rate-limited
+
+### Comic not appearing on Mastodon
+
+If the comic still does not appear after approving a post, ensure you are approving a **newly generated** post (created after the comic_media_url and URL-fallback changes). Old pending posts do not have `comic_media_url` set and will not get the comic from URL. Generate a new post (e.g. run `python generate_post_now.py` or trigger generation via the API), then approve that post in Telegram. Check logs for "Comic local path missing; downloading from comic_media_url" and "Downloaded comic from URL for Mastodon upload", and for any "Error uploading media" with full exception details.
 
 ## License
 

@@ -4,6 +4,7 @@ Comment generator for articles using Openrouter
 import logging
 from typing import List, Dict, Any, Optional
 from datetime import datetime
+from sqlalchemy.orm import Session
 
 from .openrouter_client import OpenrouterClient
 from .article_fetcher import ArticleFetcher
@@ -38,7 +39,8 @@ class CommentGenerator:
     def generate_comments(
         self,
         articles: List[Dict[str, Any]],
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        db_session: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """
         Generate comments for multiple articles
@@ -77,6 +79,34 @@ class CommentGenerator:
                 results.append(result)
                 logger.info(f"Generated comment {i+1}: {len(comment)} chars")
                 
+                # Save to database if session provided
+                if db_session and comment:
+                    try:
+                        from .database import Comment, Article
+                        # Find article by URL or ID
+                        article_id = article.get('id')
+                        if article_id:
+                            db_article = db_session.query(Article).filter(Article.id == article_id).first()
+                        else:
+                            article_url = article.get('url')
+                            if article_url:
+                                db_article = db_session.query(Article).filter(Article.url == article_url).first()
+                            else:
+                                db_article = None
+                        
+                        if db_article:
+                            db_comment = Comment(
+                                article_id=db_article.id,
+                                content=comment,
+                                generated_at=datetime.fromisoformat(result.get('comment_generated_at', datetime.now().isoformat())),
+                                posted=False
+                            )
+                            db_session.add(db_comment)
+                            db_session.flush()
+                            result['db_comment_id'] = db_comment.id
+                    except Exception as e:
+                        logger.warning(f"Failed to save comment to database: {e}")
+                
             except Exception as e:
                 logger.error(f"Error generating comment {i+1}: {e}")
                 results.append({
@@ -85,6 +115,14 @@ class CommentGenerator:
                     'error': str(e)
                 })
                 continue
+        
+        # Commit database changes if session provided
+        if db_session:
+            try:
+                db_session.commit()
+            except Exception as e:
+                logger.warning(f"Failed to commit comments to database: {e}")
+                db_session.rollback()
         
         logger.info(f"Successfully generated {len([r for r in results if r.get('comment')])} comments")
         return results
