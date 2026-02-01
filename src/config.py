@@ -35,6 +35,7 @@ class Config:
         # Notion
         self.notion_api_key = os.getenv('NOTION_API_KEY')
         self.notion_page_id = os.getenv('NOTION_PAGE_ID')
+        self.notion_database_id = os.getenv('NOTION_DATABASE_ID')  # Optional: for RAG multi-doc fetch
         
         # Mastodon
         self.mastodon_access_token = os.getenv('MASTODON_ACCESS_TOKEN')
@@ -113,8 +114,8 @@ class Config:
         if not self.notion_api_key:
             errors.append("NOTION_API_KEY not set")
         
-        if not self.notion_page_id:
-            errors.append("NOTION_PAGE_ID not set")
+        if not self.notion_page_id and not self.notion_database_id:
+            errors.append("NOTION_PAGE_ID or NOTION_DATABASE_ID must be set")
         
         if not self.mastodon_access_token:
             errors.append("MASTODON_ACCESS_TOKEN not set")

@@ -31,6 +31,14 @@ except ImportError:
     REPLICATE_AVAILABLE = False
     ReplicateImageGenerator = None
 
+# Optional RAG retriever
+try:
+    from ...rag import RAGRetriever
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    RAGRetriever = None
+
 router = APIRouter(prefix="/posts", tags=["posts"])
 
 
@@ -40,15 +48,19 @@ def generate_posts(
     db: Session = Depends(get_database),
     config: Config = Depends(get_app_config)
 ):
-    """Generate social media posts"""
+    """Generate social media posts (with RAG when indexed)"""
     try:
-        # Initialize clients
-        notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+        notion_client = NotionClient(
+            config.notion_api_key,
+            config.notion_page_id or "",
+            database_id=getattr(config, 'notion_database_id', None),
+        )
         openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
-        
-        # Initialize post generator
         max_length = config.post_settings.get('max_length', 500)
-        post_generator = PostGenerator(notion_client, openrouter_client, max_length)
+        rag_retriever = RAGRetriever() if (RAG_AVAILABLE and RAGRetriever) else None
+        post_generator = PostGenerator(
+            notion_client, openrouter_client, max_length, rag_retriever=rag_retriever
+        )
         
         # Generate posts
         posts_data = post_generator.generate_posts(
@@ -193,22 +205,23 @@ def generate_pending_post(
         # Initialize database
         init_db()
         
-        # Initialize clients
-        notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+        notion_client = NotionClient(
+            config.notion_api_key,
+            config.notion_page_id or "",
+            database_id=getattr(config, 'notion_database_id', None),
+        )
         openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
         mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
-        
-        # Initialize article fetcher
         article_fetcher = ArticleFetcher(
             rss_feeds=config.rss_feeds,
             keywords=config.article_keywords,
             max_articles_per_feed=config.article_settings.get('max_articles_per_feed', 20)
         )
-        
-        # Initialize enhanced generator
         max_length = config.post_settings.get('max_length', 500)
+        rag_retriever = RAGRetriever() if (RAG_AVAILABLE and RAGRetriever) else None
         enhanced_generator = EnhancedPostGenerator(
-            notion_client, openrouter_client, article_fetcher, max_length
+            notion_client, openrouter_client, article_fetcher, max_length,
+            rag_retriever=rag_retriever,
         )
         
         # Initialize logo handler

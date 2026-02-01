@@ -89,22 +89,27 @@ init_db()
 db_session = get_session()
 
 try:
-    # Initialize clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
     mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
-    
-    # Initialize article fetcher
     article_fetcher = ArticleFetcher(
         rss_feeds=config.rss_feeds,
         keywords=config.article_keywords,
         max_articles_per_feed=config.article_settings.get('max_articles_per_feed', 20)
     )
-    
-    # Initialize enhanced generator
     max_length = config.post_settings.get('max_length', 500)
+    try:
+        from src.rag import RAGRetriever
+        rag_retriever = RAGRetriever()
+    except ImportError:
+        rag_retriever = None
     enhanced_generator = EnhancedPostGenerator(
-        notion_client, openrouter_client, article_fetcher, max_length
+        notion_client, openrouter_client, article_fetcher, max_length,
+        rag_retriever=rag_retriever,
     )
     
     # Initialize logo handler

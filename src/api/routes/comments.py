@@ -53,8 +53,11 @@ def generate_comments(
                 'source': db_article.source
             })
         
-        # Initialize clients
-        notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+        notion_client = NotionClient(
+            config.notion_api_key,
+            config.notion_page_id or "",
+            database_id=getattr(config, 'notion_database_id', None),
+        )
         openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
         
         # Initialize comment generator

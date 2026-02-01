@@ -1,6 +1,17 @@
 # Colab Notebook Integration
 
-This directory contains scripts and examples for running the TrustStackSocial HITL workflow in Google Colab.
+This directory contains scripts and examples for running the TrustStackSocial HITL workflow in Google Colab, plus the RAG workshop reference notebook.
+
+## RAG Workshop Notebook
+
+**`SASA_workshop_4_RAG.ipynb`** – Reference implementation for RAG with hybrid search:
+
+- **Part 1**: SQLite + FTS5 + sqlite-vec (embeddings_meta, vec_embeddings, embeddings_fts)
+- **Part 2**: Document chunking by `##` headers; local embeddings with fastembed (MiniLM-L6-v2, 384 dim)
+- **Part 3**: BM25 (FTS5) + semantic (sqlite-vec) hybrid search; score fusion
+- **Part 4**: Post generation with RAG context (retrieve_context → format_context_for_prompt → LLM)
+
+The project’s RAG integration (Notion docs → chunk → SQLite → hybrid retrieval in `create_posts`) follows this notebook’s patterns: same chunking style, sqlite-vec + FTS5, fastembed, and hybrid search, with docs sourced from the Notion API instead of local `.md` files.
 
 ## Quick Start in Colab
 

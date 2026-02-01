@@ -5,12 +5,23 @@ import json
 import logging
 import os
 import tempfile
+import time
 from pathlib import Path
 from typing import Dict, Any, Optional, List
 from datetime import datetime, timedelta
 from sqlalchemy.orm import Session
 
 import requests
+
+# #region agent log
+def _debug_log(location: str, message: str, data: dict, hypothesis_id: str):
+    try:
+        log_path = Path(__file__).resolve().parent.parent / ".cursor" / "debug.log"
+        log_path.parent.mkdir(parents=True, exist_ok=True)
+        log_path.open("a").write(json.dumps({"timestamp": int(time.time() * 1000), "location": location, "message": message, "data": data, "sessionId": "debug-session", "hypothesisId": hypothesis_id}) + "\n")
+    except Exception:
+        pass
+# #endregion
 
 from .database import PendingPost, PostApproval, Post, init_db, get_session
 
@@ -208,29 +219,23 @@ class ApprovalWorkflow:
         
         try:
             pending_post = db_session.query(PendingPost).filter(PendingPost.id == pending_post_id).first()
-            
+
             if not pending_post:
+                # #region agent log
+                _debug_log("approval_workflow.py:process_approval:post_not_found", "pending post not found", {"pending_post_id": pending_post_id}, "B")
+                # #endregion
                 logger.error(f"Pending post {pending_post_id} not found")
                 return False
-            
+
             if pending_post.status != "pending":
+                # #region agent log
+                _debug_log("approval_workflow.py:process_approval:not_pending", "post not pending", {"status": pending_post.status}, "B")
+                # #endregion
                 logger.warning(f"Pending post {pending_post_id} is not in pending status: {pending_post.status}")
                 return False
-            
-            # Update pending post status
-            pending_post.status = "approved"
-            pending_post.approved_at = datetime.utcnow()
-            
-            # Create approval record
-            approval = PostApproval(
-                pending_post_id=pending_post_id,
-                action="approve",
-                telegram_user_id=telegram_user_id,
-                telegram_username=telegram_username
-            )
-            db_session.add(approval)
-            
-            # Post to Mastodon: resolve and validate image paths so comic/logo are found
+
+            # Post to Mastodon first; only mark approved and commit after success
+            # Resolve and validate image paths so comic/logo are found
             raw_paths = pending_post.image_paths
             if isinstance(raw_paths, str):
                 try:
@@ -296,33 +301,59 @@ class ApprovalWorkflow:
                         content=pending_post.content,
                         visibility="public"
                     )
-                
-                # Create regular Post record
-                regular_post = Post(
-                    content=pending_post.content,
-                    style=pending_post.style,
-                    length=pending_post.length,
-                    generated_at=pending_post.generated_at,
-                    posted=True,
-                    posted_at=datetime.utcnow(),
-                    mastodon_url=result.get('url'),
-                    mastodon_id=str(result.get('id', ''))
-                )
-                db_session.add(regular_post)
-                
-                logger.info(f"Posted pending post {pending_post_id} to Mastodon: {result.get('url')}")
-                
             except Exception as e:
+                # #region agent log
+                _debug_log("approval_workflow.py:process_approval:mastodon_failed", "Mastodon post failed", {"error": str(e)}, "B")
+                # #endregion
                 logger.error(f"Error posting to Mastodon: {e}")
-                # Still mark as approved even if posting fails
-                # The post can be manually posted later
-            finally:
                 for p in temp_paths_to_clean:
                     try:
                         os.unlink(p)
                     except OSError:
                         pass
-            
+                if not skip_telegram_edit and pending_post.telegram_message_id:
+                    try:
+                        self.telegram_bot.edit_message_after_action(
+                            int(pending_post.telegram_message_id),
+                            "approve",
+                            pending_post_id,
+                            error_message="Could not publish to Mastodon. Please check credentials and try again."
+                        )
+                    except Exception as edit_err:
+                        logger.warning(f"Error editing Telegram message: {edit_err}")
+                return False
+
+            for p in temp_paths_to_clean:
+                try:
+                    os.unlink(p)
+                except OSError:
+                    pass
+
+            # Mastodon succeeded: create Post record and mark approved
+            regular_post = Post(
+                content=pending_post.content,
+                style=pending_post.style,
+                length=pending_post.length,
+                generated_at=pending_post.generated_at,
+                posted=True,
+                posted_at=datetime.utcnow(),
+                mastodon_url=result.get('url'),
+                mastodon_id=str(result.get('id', ''))
+            )
+            db_session.add(regular_post)
+
+            pending_post.status = "approved"
+            pending_post.approved_at = datetime.utcnow()
+            approval = PostApproval(
+                pending_post_id=pending_post_id,
+                action="approve",
+                telegram_user_id=telegram_user_id,
+                telegram_username=telegram_username
+            )
+            db_session.add(approval)
+
+            logger.info(f"Posted pending post {pending_post_id} to Mastodon: {result.get('url')}")
+
             # Update Telegram message (skip when caller, e.g. bot server, will edit)
             if not skip_telegram_edit and pending_post.telegram_message_id:
                 try:
@@ -336,9 +367,15 @@ class ApprovalWorkflow:
 
             db_session.commit()
             logger.info(f"Approved pending post {pending_post_id}")
+            # #region agent log
+            _debug_log("approval_workflow.py:process_approval:return_true", "Mastodon posted, returning True", {"pending_post_id": pending_post_id}, "B")
+            # #endregion
             return True
-            
+
         except Exception as e:
+            # #region agent log
+            _debug_log("approval_workflow.py:process_approval:outer_except", "process_approval exception", {"error": str(e)}, "C")
+            # #endregion
             db_session.rollback()
             logger.error(f"Error processing approval: {e}")
             return False

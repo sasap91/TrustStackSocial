@@ -41,14 +41,22 @@ def run_full_workflow(
         from ...mastodon_client import MastodonClient
         from ...database import Post, Article, Comment
         
-        # Initialize clients
-        notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+        notion_client = NotionClient(
+            config.notion_api_key,
+            config.notion_page_id or "",
+            database_id=getattr(config, 'notion_database_id', None),
+        )
         openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
         mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
-        
-        # Step 1: Generate posts
         max_length = config.post_settings.get('max_length', 500)
-        post_generator = PostGenerator(notion_client, openrouter_client, max_length)
+        try:
+            from ...rag import RAGRetriever
+            rag_retriever = RAGRetriever()
+        except ImportError:
+            rag_retriever = None
+        post_generator = PostGenerator(
+            notion_client, openrouter_client, max_length, rag_retriever=rag_retriever
+        )
         posts_data = post_generator.generate_posts(count=post_count)
         
         posts_generated = 0

@@ -209,6 +209,40 @@ Display your Mastodon account information:
 python main.py account-info
 ```
 
+### Listeners (Auto-create and Auto-reply)
+
+**Notion listener** – Poll Notion for doc changes; when content changes, re-index RAG and optionally generate and post one new post:
+
+```bash
+python main.py listen-notion --interval 300
+```
+
+- `--interval` / `-i`: Poll interval in seconds (default 300).
+- `--no-post`: Only re-index RAG on change; do not auto-post.
+- `--no-rag`: Do not re-index RAG (only run optional on_change / generate_and_post).
+
+**Mastodon listener** – Poll Mastodon for new mentions; generate and optionally post replies:
+
+```bash
+python main.py listen-mastodon --interval 60
+```
+
+- `--interval` / `-i`: Poll interval in seconds (default 60).
+- `--no-post`: Generate replies but do not post to Mastodon.
+- `--max-replies`: Max replies per poll (default 5).
+
+State for both listeners is stored under `data/` (e.g. `data/notion_listener_state.json`, `data/mastodon_listener_state.json`).
+
+**List posts from SQLite DB** – Retrieve stored posts (generated and/or posted):
+
+```bash
+python main.py list-posts --limit 20
+python main.py list-posts --posted    # only posted
+python main.py list-posts --unposted  # only unposted
+```
+
+Generated posts are stored in the SQLite DB when you run `generate-posts` (with DB) or when the Notion listener auto-creates a post; use `list-posts` to query them.
+
 ## Configuration
 
 Edit `config.yaml` to customize:

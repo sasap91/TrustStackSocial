@@ -277,6 +277,35 @@ class MastodonClient:
             logger.error(f"Error searching Mastodon: {e}")
             return []
     
+    def get_notifications(
+        self,
+        since_id: Optional[str] = None,
+        limit: int = 20,
+        types: Optional[List[str]] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Fetch notifications (e.g. mentions) for the logged-in account.
+
+        Args:
+            since_id: Return only notifications after this ID (for polling).
+            limit: Maximum number to return.
+            types: Optional list of notification types (e.g. ['mention']).
+
+        Returns:
+            List of notification objects (id, type, created_at, status, account, ...).
+        """
+        try:
+            kwargs: Dict[str, Any] = {"limit": limit}
+            if since_id is not None:
+                kwargs["since_id"] = since_id
+            if types is not None:
+                kwargs["types"] = types
+            notifications = self.client.notifications(**kwargs)
+            return list(notifications) if notifications else []
+        except Exception as e:
+            logger.error("Error fetching notifications: %s", e)
+            return []
+
     def reply_to_status(
         self,
         status_id: str,

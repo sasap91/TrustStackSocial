@@ -1,8 +1,8 @@
 """
-Social media post generator using Openrouter and Notion
+Social media post generator using Openrouter and Notion (optional RAG).
 """
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from datetime import datetime
 from sqlalchemy.orm import Session
 
@@ -10,30 +10,36 @@ from .notion_client import NotionClient
 from .openrouter_client import OpenrouterClient
 from .utils import truncate_text, clean_text
 
+if TYPE_CHECKING:
+    from .rag.search import RAGRetriever
+
 logger = logging.getLogger(__name__)
 
 
 class PostGenerator:
-    """Generate social media posts based on company information"""
-    
+    """Generate social media posts based on company information (Notion or RAG)."""
+
     def __init__(
         self,
         notion_client: NotionClient,
         openrouter_client: OpenrouterClient,
-        max_length: int = 500
+        max_length: int = 500,
+        rag_retriever: Optional["RAGRetriever"] = None,
     ):
         """
-        Initialize post generator
-        
+        Initialize post generator.
+
         Args:
-            notion_client: Notion client for fetching company info
+            notion_client: Notion client for fetching company info (fallback if no RAG)
             openrouter_client: Openrouter client for generation
             max_length: Maximum post length
+            rag_retriever: Optional RAG retriever for hybrid-search context (used when provided)
         """
         self.notion_client = notion_client
         self.openrouter_client = openrouter_client
         self.max_length = max_length
-        logger.info("Initialized PostGenerator")
+        self.rag_retriever = rag_retriever
+        logger.info("Initialized PostGenerator (RAG=%s)", rag_retriever is not None)
     
     def generate_posts(
         self,
@@ -54,10 +60,10 @@ class PostGenerator:
             List of generated posts with metadata
         """
         logger.info(f"Generating {count} social media posts")
-        
-        # Fetch company information
-        company_info = self.notion_client.get_company_info_summary()
-        logger.info("Fetched company information from Notion")
+
+        # Company context: RAG hybrid search if available, else Notion summary
+        company_info = self._get_company_context(style=None)
+        logger.info("Fetched company context for post generation")
         
         # Default styles
         if styles is None:
@@ -143,12 +149,11 @@ class PostGenerator:
             Generated post with metadata
         """
         logger.info(f"Generating single post with style: {style}")
-        
-        # Use custom context or fetch from Notion
+
         if custom_context:
             company_info = custom_context
         else:
-            company_info = self.notion_client.get_company_info_summary()
+            company_info = self._get_company_context(style=style)
         
         post_content = self.openrouter_client.generate_social_post(
             company_info=company_info,
@@ -202,4 +207,19 @@ Refined post:"""
         )
         
         return truncate_text(clean_text(refined), self.max_length)
+
+    def _get_company_context(self, style: Optional[str] = None) -> str:
+        """Get company context from RAG (hybrid search) if available, else Notion summary."""
+        if self.rag_retriever:
+            query = "TrustStack company information"
+            if style:
+                query = f"TrustStack company {style} post"
+            try:
+                context, results = self.rag_retriever.retrieve_context(query=query, top_k=5)
+                if context and "No relevant context found" not in context and results:
+                    logger.info("Using RAG context (%d chunks)", len(results))
+                    return context
+            except Exception as e:
+                logger.warning("RAG retrieval failed, falling back to Notion: %s", e)
+        return self.notion_client.get_company_info_summary()
 

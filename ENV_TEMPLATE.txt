@@ -7,6 +7,8 @@ OPENROUTER_MODEL=anthropic/claude-3.5-sonnet
 # Notion API Configuration
 NOTION_API_KEY=your_notion_api_key_here
 NOTION_PAGE_ID=your_notion_page_id_here
+# Optional: Notion database ID for RAG (multiple docs). If set, fetch_docs uses database; else single page.
+NOTION_DATABASE_ID=
 
 # Mastodon API Configuration
 MASTODON_ACCESS_TOKEN=your_mastodon_access_token_here

@@ -70,7 +70,7 @@ from src.manual_post_generator import ManualPostGenerator
 from src.telegram_bot import TelegramBot
 from src.approval_workflow import ApprovalWorkflow
 from src.image_handler import LogoHandler
-from src.database import PendingPost, get_session, init_db
+from src.database import PendingPost, Post, get_session, init_db
 
 # Optional import for image generation
 try:
@@ -79,6 +79,14 @@ try:
 except ImportError:
     REPLICATE_AVAILABLE = False
     ReplicateImageGenerator = None
+
+# Optional RAG retriever (sqlite-vec + fastembed)
+try:
+    from src.rag import RAGRetriever
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    RAGRetriever = None
 
 # Setup logging
 setup_logging()
@@ -117,18 +125,23 @@ def cli(ctx):
 @click.option('--use-json', is_flag=True, help='Save to JSON file instead of database')
 @click.pass_context
 def generate_posts(ctx, count, output, temperature, use_db, use_json):
-    """Generate social media posts from Notion content"""
+    """Generate social media posts from Notion content (with RAG when indexed)"""
     click.echo(f"Generating {count} social media posts...")
-    
+
     config = ctx.obj['config']
-    
-    # Initialize clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id,
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
-    
-    # Initialize post generator
     max_length = config.post_settings.get('max_length', 500)
-    post_generator = PostGenerator(notion_client, openrouter_client, max_length)
+    rag_retriever = None
+    if RAG_AVAILABLE and RAGRetriever:
+        rag_retriever = RAGRetriever()
+    post_generator = PostGenerator(
+        notion_client, openrouter_client, max_length, rag_retriever=rag_retriever
+    )
     
     # Determine storage method
     save_to_db = use_db and not use_json
@@ -166,6 +179,160 @@ def generate_posts(ctx, count, output, temperature, use_db, use_json):
 
 
 @cli.command()
+@click.pass_context
+def index_rag(ctx):
+    """Index Notion docs into RAG DB (chunk + embed). Run before using RAG in generate_posts."""
+    try:
+        from src.rag import index_notion_docs
+    except ImportError as e:
+        click.echo(f"RAG dependencies missing: {e}. Install: pip install sqlite-vec fastembed", err=True)
+        sys.exit(1)
+    config = ctx.obj['config']
+    if not config.notion_api_key or not (config.notion_page_id or getattr(config, 'notion_database_id', None)):
+        click.echo("Set NOTION_API_KEY and NOTION_PAGE_ID (or NOTION_DATABASE_ID) in .env", err=True)
+        sys.exit(1)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
+    click.echo("Fetching Notion docs, chunking, and embedding...")
+    total = index_notion_docs(notion_client)
+    click.echo(f"✓ Indexed {total} chunks into RAG DB.")
+
+
+@cli.command()
+@click.option('--interval', '-i', default=300, help='Poll interval in seconds')
+@click.option('--no-post', is_flag=True, help='Only re-index RAG on change; do not auto-post')
+@click.option('--no-rag', is_flag=True, help='Do not re-index RAG on change')
+@click.pass_context
+def listen_notion(ctx, interval, no_post, no_rag):
+    """Poll Notion for doc changes; re-index RAG and optionally auto-create and post one post."""
+    try:
+        from src.listeners.notion_listener import run_notion_listener
+    except ImportError as e:
+        click.echo(f"Listeners module missing: {e}", err=True)
+        sys.exit(1)
+    config = ctx.obj['config']
+    if not config.notion_api_key or not (config.notion_page_id or getattr(config, 'notion_database_id', None)):
+        click.echo("Set NOTION_API_KEY and NOTION_PAGE_ID (or NOTION_DATABASE_ID)", err=True)
+        sys.exit(1)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
+    generate_and_post_cb = None
+    if not no_post:
+        openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
+        max_length = config.post_settings.get('max_length', 500)
+        rag_retriever = RAGRetriever() if (RAG_AVAILABLE and RAGRetriever) else None
+        post_generator = PostGenerator(
+            notion_client, openrouter_client, max_length, rag_retriever=rag_retriever
+        )
+        mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
+        def _generate_and_post():
+            init_db()
+            db_session = None
+            try:
+                db_session = get_session()
+                posts = post_generator.generate_posts(
+                    count=1, temperature=0.7, db_session=db_session
+                )
+                if not posts:
+                    return False
+                result = mastodon_client.post(posts[0]['content'])
+                db_post_id = posts[0].get('db_id')
+                if db_post_id and db_session:
+                    from datetime import datetime
+                    db_post = db_session.query(Post).filter(Post.id == db_post_id).first()
+                    if db_post:
+                        db_post.posted = True
+                        db_post.posted_at = datetime.utcnow()
+                        db_post.mastodon_url = result.get('url')
+                        db_post.mastodon_id = str(result.get('id', ''))
+                        db_session.commit()
+                return True
+            except Exception as e:
+                logger.exception("generate_and_post failed: %s", e)
+                if db_session:
+                    db_session.rollback()
+                return False
+            finally:
+                if db_session:
+                    db_session.close()
+        generate_and_post_cb = _generate_and_post
+    click.echo("Notion listener started (Ctrl+C to stop)")
+    run_notion_listener(
+        notion_client,
+        interval_seconds=interval,
+        reindex_rag=not no_rag,
+        generate_and_post=generate_and_post_cb,
+    )
+
+
+@cli.command()
+@click.option('--interval', '-i', default=60, help='Poll interval in seconds')
+@click.option('--no-post', is_flag=True, help='Generate replies but do not post to Mastodon')
+@click.option('--max-replies', default=5, help='Max replies per poll')
+@click.pass_context
+def listen_mastodon(ctx, interval, no_post, max_replies):
+    """Poll Mastodon for new mentions; generate and optionally post replies."""
+    try:
+        from src.listeners.mastodon_listener import run_mastodon_listener
+    except ImportError as e:
+        click.echo(f"Listeners module missing: {e}", err=True)
+        sys.exit(1)
+    config = ctx.obj['config']
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
+    openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
+    reply_generator = ReplyGenerator(openrouter_client, notion_client, max_length=500)
+    mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
+    click.echo("Mastodon listener started (Ctrl+C to stop)")
+    run_mastodon_listener(
+        mastodon_client,
+        reply_generator,
+        interval_seconds=interval,
+        post_reply=not no_post,
+        max_replies_per_run=max_replies,
+    )
+
+
+@cli.command()
+@click.option('--limit', '-n', default=20, help='Max posts to show')
+@click.option('--skip', default=0, help='Skip first N posts')
+@click.option('--posted', is_flag=True, help='Show only posted posts')
+@click.option('--unposted', is_flag=True, help='Show only unposted posts')
+@click.pass_context
+def list_posts(ctx, limit, skip, posted, unposted):
+    """List posts from SQLite DB (storage for retrieval)"""
+    init_db()
+    db = get_session()
+    try:
+        query = db.query(Post)
+        if posted and not unposted:
+            query = query.filter(Post.posted == True)
+        elif unposted and not posted:
+            query = query.filter(Post.posted == False)
+        total = query.count()
+        posts = query.order_by(Post.generated_at.desc()).offset(skip).limit(limit).all()
+        click.echo(f"Posts in DB: {total} total (showing {len(posts)})")
+        for p in posts:
+            status = "✓ Posted" if p.posted else "○ Not posted"
+            url = f" {p.mastodon_url}" if p.mastodon_url else ""
+            click.echo(f"  {p.id}. [{status}] {p.style} ({p.length} chars){url}")
+            click.echo(f"      {p.content[:80]}..." if len(p.content) > 80 else f"      {p.content}")
+        if not posts:
+            click.echo("  (none)")
+    finally:
+        db.close()
+
+
+@cli.command()
 @click.option('--file', '-f', default='output/posts.json', help='Input file with posts')
 @click.option('--index', '-i', type=int, help='Post index to post (0-based)')
 @click.option('--all', 'post_all', is_flag=True, help='Post all posts from file')
@@ -174,7 +341,7 @@ def generate_posts(ctx, count, output, temperature, use_db, use_json):
 def post_to_mastodon(ctx, file, index, post_all, preview):
     """Post generated content to Mastodon"""
     config = ctx.obj['config']
-    
+
     # Load posts
     try:
         posts = load_json(file)
@@ -338,9 +505,13 @@ def generate_comments(ctx, file, output, temperature, use_db, use_json):
         sys.exit(1)
     
     # Initialize clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
-    
+
     # Initialize comment generator
     max_length = config.comment_settings.get('max_length', 300)
     comment_generator = CommentGenerator(openrouter_client, notion_client, max_length)
@@ -406,13 +577,17 @@ def post_comments(ctx, file, index, preview):
         sys.exit(1)
     
     # Initialize clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
     mastodon_client = MastodonClient(
         config.mastodon_access_token,
         config.mastodon_api_base_url
     )
-    
+
     max_length = config.comment_settings.get('max_length', 300)
     comment_generator = CommentGenerator(openrouter_client, notion_client, max_length)
     
@@ -574,9 +749,13 @@ def search_and_reply(ctx, keyword, count, output, post_replies):
         click.echo(f"   URL: {post['url']}")
     
     # Initialize AI clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
-    
+
     # Generate replies using structured outputs
     click.echo(f"\n🤖 Generating replies using AI structured outputs...")
     
@@ -667,10 +846,14 @@ def generate_pending_post(ctx, style, temperature, max_articles):
         db_session = get_session()
         
         # Initialize clients
-        notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+        notion_client = NotionClient(
+            config.notion_api_key,
+            config.notion_page_id or "",
+            database_id=getattr(config, 'notion_database_id', None),
+        )
         openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
         mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
-        
+
         # Initialize article fetcher
         article_fetcher = ArticleFetcher(
             rss_feeds=config.rss_feeds,
@@ -678,10 +861,11 @@ def generate_pending_post(ctx, style, temperature, max_articles):
             max_articles_per_feed=config.article_settings.get('max_articles_per_feed', 20)
         )
         
-        # Initialize enhanced generator
         max_length = config.post_settings.get('max_length', 500)
+        rag_retriever = RAGRetriever() if (RAG_AVAILABLE and RAGRetriever) else None
         enhanced_generator = EnhancedPostGenerator(
-            notion_client, openrouter_client, article_fetcher, max_length
+            notion_client, openrouter_client, article_fetcher, max_length,
+            rag_retriever=rag_retriever,
         )
         
         # Initialize logo handler

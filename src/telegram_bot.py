@@ -178,7 +178,8 @@ class TelegramBot:
         self,
         message_id: int,
         action: str,
-        pending_post_id: int
+        pending_post_id: int,
+        error_message: Optional[str] = None
     ) -> bool:
         """
         Edit message after approval/rejection action
@@ -187,14 +188,19 @@ class TelegramBot:
             message_id: Telegram message ID
             action: Action taken (approve/reject)
             pending_post_id: Pending post ID
+            error_message: If set (e.g. Mastodon post failed), show this instead of success
             
         Returns:
             True if successful
         """
         async def _edit():
             try:
-                status_text = "✅ Approved" if action == "approve" else "❌ Rejected"
-                new_text = f"{status_text}\n\nPost ID: {pending_post_id}\nAction taken at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+                if error_message:
+                    status_text = "❌ Failed to post"
+                    new_text = f"{status_text}\n\nPost ID: {pending_post_id}\n{error_message}"
+                else:
+                    status_text = "✅ Approved" if action == "approve" else "❌ Rejected"
+                    new_text = f"{status_text}\n\nPost ID: {pending_post_id}\nAction taken at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
                 
                 await self.bot.edit_message_text(
                     chat_id=self.approval_chat_id,

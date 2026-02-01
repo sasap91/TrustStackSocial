@@ -71,14 +71,15 @@ socket.getaddrinfo = getaddrinfo_ipv4
 
 class NotionClient:
     """Client for fetching company information from Notion"""
-    
-    def __init__(self, api_key: str, page_id: str):
+
+    def __init__(self, api_key: str, page_id: str, database_id: Optional[str] = None):
         """
         Initialize Notion client
-        
+
         Args:
             api_key: Notion API key
             page_id: Notion page ID containing company information
+            database_id: Optional Notion database ID for fetching multiple docs (RAG)
         """
         # Fix 2: Force IPv4
         socket.has_ipv6 = False
@@ -97,8 +98,115 @@ class NotionClient:
             client=http_client
         )
         self.page_id = page_id
+        self.database_id = database_id
         self._cached_content = None
-    
+
+    def _content_to_markdown(self, content: Dict[str, Any], title: str) -> str:
+        """Convert parsed block content to markdown text (for chunking/RAG)."""
+        summary_parts = [f"# {title}\n"]
+        parsed = content.get('content', content) if isinstance(content, dict) else {}
+        if isinstance(parsed, dict):
+            for heading in parsed.get('headings', []):
+                level = heading.get('level', 1)
+                summary_parts.append(f"\n{'#' * (level + 1)} {heading.get('text', '')}")
+            for paragraph in parsed.get('paragraphs', []):
+                summary_parts.append(paragraph)
+            for item in parsed.get('lists', []):
+                summary_parts.append(f"- {item}")
+            for quote in parsed.get('quotes', []):
+                summary_parts.append(f"> {quote}")
+        return '\n\n'.join(summary_parts).strip() or title
+
+    def _fetch_single_page_as_doc(self, page_id: str) -> Dict[str, Any]:
+        """Fetch one page and return {id, title, text, source_url}."""
+        page = self.client.pages.retrieve(page_id=page_id)
+        title = self._extract_page_title(page)
+        blocks = self.client.blocks.children.list(block_id=page_id)
+        parsed = self._parse_blocks(blocks.get('results', []))
+        raw_text = self._blocks_to_text(blocks.get('results', []))
+        text = self._content_to_markdown({'content': parsed}, title) or raw_text or title
+        source_url = f"https://www.notion.so/{page_id.replace('-', '')}"
+        return {"id": page_id, "title": title, "text": text, "source_url": source_url}
+
+    def fetch_docs(self, force_refresh: bool = False) -> List[Dict[str, Any]]:
+        """
+        Fetch documents from Notion for RAG: multiple pages from a database, or single page.
+
+        Returns:
+            List of {"id": str, "title": str, "text": str, "source_url": str} (markdown per doc).
+        """
+        docs: List[Dict[str, Any]] = []
+        if self.database_id:
+            try:
+                start_cursor: Optional[str] = None
+                while True:
+                    kwargs: Dict[str, Any] = {"database_id": self.database_id}
+                    if start_cursor:
+                        kwargs["start_cursor"] = start_cursor
+                    response = self.client.databases.query(**kwargs)
+                    for page in response.get("results", []):
+                        page_id = page.get("id")
+                        if not page_id:
+                            continue
+                        try:
+                            doc = self._fetch_single_page_as_doc(page_id)
+                            docs.append(doc)
+                            logger.info(f"Fetched doc: {doc['title'][:50]}")
+                        except Exception as e:
+                            logger.warning(f"Skip page {page_id}: {e}")
+                    if not response.get("has_more"):
+                        break
+                    start_cursor = response.get("next_cursor") or None
+                    if not start_cursor:
+                        break
+            except APIResponseError as e:
+                logger.error(f"Notion database query error: {e}")
+                raise
+        if not docs and self.page_id:
+            doc = self._fetch_single_page_as_doc(self.page_id)
+            docs.append(doc)
+            logger.info(f"Fetched single page doc: {doc['title'][:50]}")
+        return docs
+
+    def get_docs_last_edited(self) -> Dict[str, str]:
+        """
+        Get last_edited_time for each doc (page or database pages) without fetching full content.
+        Returns dict mapping page_id -> last_edited_time (ISO string) for change detection.
+        """
+        out: Dict[str, str] = {}
+        if self.database_id:
+            try:
+                start_cursor: Optional[str] = None
+                while True:
+                    kwargs: Dict[str, Any] = {"database_id": self.database_id}
+                    if start_cursor:
+                        kwargs["start_cursor"] = start_cursor
+                    response = self.client.databases.query(**kwargs)
+                    for page in response.get("results", []):
+                        pid = page.get("id")
+                        if not pid:
+                            continue
+                        edited = page.get("last_edited_time")
+                        if edited:
+                            out[pid] = edited
+                    if not response.get("has_more"):
+                        break
+                    start_cursor = response.get("next_cursor") or None
+                    if not start_cursor:
+                        break
+            except APIResponseError as e:
+                logger.error(f"Notion database query error: {e}")
+                raise
+        if not out and self.page_id:
+            try:
+                page = self.client.pages.retrieve(page_id=self.page_id)
+                edited = page.get("last_edited_time")
+                if edited:
+                    out[self.page_id] = edited
+            except Exception as e:
+                logger.warning(f"Could not get last_edited for page: {e}")
+        return out
+
     def fetch_page_content(self, force_refresh: bool = False) -> Dict[str, Any]:
         """
         Fetch content from Notion page

@@ -1,8 +1,8 @@
 """
-Enhanced post generator that incorporates news articles with quotes
+Enhanced post generator that incorporates news articles with quotes (optional RAG).
 """
 import logging
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, TYPE_CHECKING
 from datetime import datetime
 from sqlalchemy.orm import Session
 
@@ -12,33 +12,39 @@ from .article_fetcher import ArticleFetcher
 from .database import Article
 from .utils import truncate_text, clean_text
 
+if TYPE_CHECKING:
+    from .rag.search import RAGRetriever
+
 logger = logging.getLogger(__name__)
 
 
 class EnhancedPostGenerator:
-    """Generate social media posts with news context and quotes"""
-    
+    """Generate social media posts with news context and quotes (optional RAG)."""
+
     def __init__(
         self,
         notion_client: NotionClient,
         openrouter_client: OpenrouterClient,
         article_fetcher: ArticleFetcher,
-        max_length: int = 500
+        max_length: int = 500,
+        rag_retriever: Optional["RAGRetriever"] = None,
     ):
         """
-        Initialize enhanced post generator
-        
+        Initialize enhanced post generator.
+
         Args:
             notion_client: Notion client for fetching company info
             openrouter_client: Openrouter client for generation
             article_fetcher: Article fetcher for news
             max_length: Maximum post length
+            rag_retriever: Optional RAG retriever for company context
         """
         self.notion_client = notion_client
         self.openrouter_client = openrouter_client
         self.article_fetcher = article_fetcher
         self.max_length = max_length
-        logger.info("Initialized EnhancedPostGenerator")
+        self.rag_retriever = rag_retriever
+        logger.info("Initialized EnhancedPostGenerator (RAG=%s)", rag_retriever is not None)
     
     def extract_quotes_from_articles(self, articles: List[Dict[str, Any]], max_quotes: int = 3) -> List[Dict[str, Any]]:
         """
@@ -64,6 +70,21 @@ class EnhancedPostGenerator:
             })
         logger.info(f"Extracted {len(quotes)} quotes from articles (non-LLM)")
         return quotes
+
+    def _get_company_context(self, style: Optional[str] = None) -> str:
+        """Get company context from RAG if available, else Notion summary."""
+        if self.rag_retriever:
+            query = "TrustStack company information"
+            if style:
+                query = f"TrustStack company {style} post"
+            try:
+                context, results = self.rag_retriever.retrieve_context(query=query, top_k=5)
+                if context and "No relevant context found" not in context and results:
+                    logger.info("Using RAG context (%d chunks)", len(results))
+                    return context
+            except Exception as e:
+                logger.warning("RAG retrieval failed, falling back to Notion: %s", e)
+        return self.notion_client.get_company_info_summary()
 
     def _template_post(
         self,
@@ -109,10 +130,9 @@ class EnhancedPostGenerator:
             Generated post with metadata including articles and quotes used
         """
         logger.info(f"Generating post with news (style: {style})")
-        
-        # Fetch company information
-        company_info = self.notion_client.get_company_info_summary()
-        logger.info("Fetched company information from Notion")
+
+        company_info = self._get_company_context(style)
+        logger.info("Fetched company context for post")
         
         # Get articles
         articles = []
