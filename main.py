@@ -4,9 +4,54 @@ TrustStack Social Media Automation - Main CLI
 """
 import os
 import sys
+import socket
 import click
 import logging
 from pathlib import Path
+
+# Fix 1: Force IPv4 and set socket defaults (CRITICAL)
+socket.setdefaulttimeout(30)
+socket.has_ipv6 = False
+
+# Patch getaddrinfo to force IPv4 only
+_original_getaddrinfo = socket.getaddrinfo
+
+def getaddrinfo_ipv4(*args, **kwargs):
+    """Force IPv4-only DNS resolution"""
+    # Remove IPv6 family if specified
+    if len(args) >= 3:
+        family = args[2]
+        if family == socket.AF_UNSPEC:
+            family = socket.AF_INET
+        elif family == socket.AF_INET6:
+            family = socket.AF_INET
+        args = list(args)
+        args[2] = family
+        args = tuple(args)
+    else:
+        # Default to IPv4
+        kwargs['family'] = socket.AF_INET
+    
+    try:
+        return _original_getaddrinfo(*args, **kwargs)
+    except socket.gaierror as e:
+        # If DNS fails, try with explicit IPv4
+        if len(args) >= 3:
+            args = list(args)
+            args[2] = socket.AF_INET
+            args = tuple(args)
+        return _original_getaddrinfo(*args, **kwargs)
+
+socket.getaddrinfo = getaddrinfo_ipv4
+
+# Fix 2: Disable proxy inheritance
+for k in ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy"]:
+    os.environ.pop(k, None)
+
+# Fix 3: Debug output for Python executable
+print("PYTHON EXECUTABLE:", sys.executable)
+print("PYTHON VERSION:", sys.version)
+print("DNS Resolution: Forced IPv4 only")
 
 # Add src to path
 sys.path.insert(0, str(Path(__file__).parent))
@@ -20,6 +65,28 @@ from src.mastodon_client import MastodonClient
 from src.article_fetcher import ArticleFetcher
 from src.comment_generator import CommentGenerator
 from src.reply_generator import ReplyGenerator
+from src.enhanced_post_generator import EnhancedPostGenerator
+from src.manual_post_generator import ManualPostGenerator
+from src.telegram_bot import TelegramBot
+from src.approval_workflow import ApprovalWorkflow
+from src.image_handler import LogoHandler
+from src.database import PendingPost, Post, get_session, init_db
+
+# Optional import for image generation
+try:
+    from src.replicate_image_generator import ReplicateImageGenerator
+    REPLICATE_AVAILABLE = True
+except ImportError:
+    REPLICATE_AVAILABLE = False
+    ReplicateImageGenerator = None
+
+# Optional RAG retriever (sqlite-vec + fastembed)
+try:
+    from src.rag import RAGRetriever
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    RAGRetriever = None
 
 # Setup logging
 setup_logging()
@@ -54,35 +121,215 @@ def cli(ctx):
 @click.option('--count', '-c', default=5, help='Number of posts to generate')
 @click.option('--output', '-o', default='output/posts.json', help='Output file path')
 @click.option('--temperature', '-t', default=0.7, help='Sampling temperature')
+@click.option('--use-db', is_flag=True, default=True, help='Save to database (default)')
+@click.option('--use-json', is_flag=True, help='Save to JSON file instead of database')
 @click.pass_context
-def generate_posts(ctx, count, output, temperature):
-    """Generate social media posts from Notion content"""
+def generate_posts(ctx, count, output, temperature, use_db, use_json):
+    """Generate social media posts from Notion content (with RAG when indexed)"""
     click.echo(f"Generating {count} social media posts...")
-    
+
     config = ctx.obj['config']
-    
-    # Initialize clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id,
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
-    
-    # Initialize post generator
     max_length = config.post_settings.get('max_length', 500)
-    post_generator = PostGenerator(notion_client, openrouter_client, max_length)
+    rag_retriever = None
+    if RAG_AVAILABLE and RAGRetriever:
+        rag_retriever = RAGRetriever()
+    post_generator = PostGenerator(
+        notion_client, openrouter_client, max_length, rag_retriever=rag_retriever
+    )
+    
+    # Determine storage method
+    save_to_db = use_db and not use_json
+    db_session = None
+    
+    if save_to_db:
+        from src.database import get_session, init_db
+        init_db()
+        db_session = get_session()
     
     # Generate posts
-    posts = post_generator.generate_posts(count=count, temperature=temperature)
+    posts = post_generator.generate_posts(
+        count=count, 
+        temperature=temperature,
+        db_session=db_session
+    )
     
-    # Save to file
-    save_json(posts, output)
+    # Save to JSON if requested or if not using database
+    if use_json or not save_to_db:
+        save_json(posts, output)
+        click.echo(f"✓ Saved to {output}")
+    
+    if save_to_db:
+        click.echo(f"✓ Saved to database")
+        if db_session:
+            db_session.close()
     
     click.echo(f"\n✓ Generated {len(posts)} posts")
-    click.echo(f"✓ Saved to {output}")
     
     # Display preview
     click.echo("\nPreview of generated posts:")
     for i, post in enumerate(posts[:3], 1):
         click.echo(f"\n--- Post {i} ({post['style']}) ---")
         click.echo(post['content'][:150] + "..." if len(post['content']) > 150 else post['content'])
+
+
+@cli.command()
+@click.pass_context
+def index_rag(ctx):
+    """Index Notion docs into RAG DB (chunk + embed). Run before using RAG in generate_posts."""
+    try:
+        from src.rag import index_notion_docs
+    except ImportError as e:
+        click.echo(f"RAG dependencies missing: {e}. Install: pip install sqlite-vec fastembed", err=True)
+        sys.exit(1)
+    config = ctx.obj['config']
+    if not config.notion_api_key or not (config.notion_page_id or getattr(config, 'notion_database_id', None)):
+        click.echo("Set NOTION_API_KEY and NOTION_PAGE_ID (or NOTION_DATABASE_ID) in .env", err=True)
+        sys.exit(1)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
+    click.echo("Fetching Notion docs, chunking, and embedding...")
+    total = index_notion_docs(notion_client)
+    click.echo(f"✓ Indexed {total} chunks into RAG DB.")
+
+
+@cli.command()
+@click.option('--interval', '-i', default=300, help='Poll interval in seconds')
+@click.option('--no-post', is_flag=True, help='Only re-index RAG on change; do not auto-post')
+@click.option('--no-rag', is_flag=True, help='Do not re-index RAG on change')
+@click.pass_context
+def listen_notion(ctx, interval, no_post, no_rag):
+    """Poll Notion for doc changes; re-index RAG and optionally auto-create and post one post."""
+    try:
+        from src.listeners.notion_listener import run_notion_listener
+    except ImportError as e:
+        click.echo(f"Listeners module missing: {e}", err=True)
+        sys.exit(1)
+    config = ctx.obj['config']
+    if not config.notion_api_key or not (config.notion_page_id or getattr(config, 'notion_database_id', None)):
+        click.echo("Set NOTION_API_KEY and NOTION_PAGE_ID (or NOTION_DATABASE_ID)", err=True)
+        sys.exit(1)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
+    generate_and_post_cb = None
+    if not no_post:
+        openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
+        max_length = config.post_settings.get('max_length', 500)
+        rag_retriever = RAGRetriever() if (RAG_AVAILABLE and RAGRetriever) else None
+        post_generator = PostGenerator(
+            notion_client, openrouter_client, max_length, rag_retriever=rag_retriever
+        )
+        mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
+        def _generate_and_post():
+            init_db()
+            db_session = None
+            try:
+                db_session = get_session()
+                posts = post_generator.generate_posts(
+                    count=1, temperature=0.7, db_session=db_session
+                )
+                if not posts:
+                    return False
+                result = mastodon_client.post(posts[0]['content'])
+                db_post_id = posts[0].get('db_id')
+                if db_post_id and db_session:
+                    from datetime import datetime
+                    db_post = db_session.query(Post).filter(Post.id == db_post_id).first()
+                    if db_post:
+                        db_post.posted = True
+                        db_post.posted_at = datetime.utcnow()
+                        db_post.mastodon_url = result.get('url')
+                        db_post.mastodon_id = str(result.get('id', ''))
+                        db_session.commit()
+                return True
+            except Exception as e:
+                logger.exception("generate_and_post failed: %s", e)
+                if db_session:
+                    db_session.rollback()
+                return False
+            finally:
+                if db_session:
+                    db_session.close()
+        generate_and_post_cb = _generate_and_post
+    click.echo("Notion listener started (Ctrl+C to stop)")
+    run_notion_listener(
+        notion_client,
+        interval_seconds=interval,
+        reindex_rag=not no_rag,
+        generate_and_post=generate_and_post_cb,
+    )
+
+
+@cli.command()
+@click.option('--interval', '-i', default=60, help='Poll interval in seconds')
+@click.option('--no-post', is_flag=True, help='Generate replies but do not post to Mastodon')
+@click.option('--max-replies', default=5, help='Max replies per poll')
+@click.pass_context
+def listen_mastodon(ctx, interval, no_post, max_replies):
+    """Poll Mastodon for new mentions; generate and optionally post replies."""
+    try:
+        from src.listeners.mastodon_listener import run_mastodon_listener
+    except ImportError as e:
+        click.echo(f"Listeners module missing: {e}", err=True)
+        sys.exit(1)
+    config = ctx.obj['config']
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
+    openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
+    reply_generator = ReplyGenerator(openrouter_client, notion_client, max_length=500)
+    mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
+    click.echo("Mastodon listener started (Ctrl+C to stop)")
+    run_mastodon_listener(
+        mastodon_client,
+        reply_generator,
+        interval_seconds=interval,
+        post_reply=not no_post,
+        max_replies_per_run=max_replies,
+    )
+
+
+@cli.command()
+@click.option('--limit', '-n', default=20, help='Max posts to show')
+@click.option('--skip', default=0, help='Skip first N posts')
+@click.option('--posted', is_flag=True, help='Show only posted posts')
+@click.option('--unposted', is_flag=True, help='Show only unposted posts')
+@click.pass_context
+def list_posts(ctx, limit, skip, posted, unposted):
+    """List posts from SQLite DB (storage for retrieval)"""
+    init_db()
+    db = get_session()
+    try:
+        query = db.query(Post)
+        if posted and not unposted:
+            query = query.filter(Post.posted == True)
+        elif unposted and not posted:
+            query = query.filter(Post.posted == False)
+        total = query.count()
+        posts = query.order_by(Post.generated_at.desc()).offset(skip).limit(limit).all()
+        click.echo(f"Posts in DB: {total} total (showing {len(posts)})")
+        for p in posts:
+            status = "✓ Posted" if p.posted else "○ Not posted"
+            url = f" {p.mastodon_url}" if p.mastodon_url else ""
+            click.echo(f"  {p.id}. [{status}] {p.style} ({p.length} chars){url}")
+            click.echo(f"      {p.content[:80]}..." if len(p.content) > 80 else f"      {p.content}")
+        if not posts:
+            click.echo("  (none)")
+    finally:
+        db.close()
 
 
 @cli.command()
@@ -94,7 +341,7 @@ def generate_posts(ctx, count, output, temperature):
 def post_to_mastodon(ctx, file, index, post_all, preview):
     """Post generated content to Mastodon"""
     config = ctx.obj['config']
-    
+
     # Load posts
     try:
         posts = load_json(file)
@@ -163,8 +410,10 @@ def post_to_mastodon(ctx, file, index, post_all, preview):
 @click.option('--output', '-o', default='output/articles.json', help='Output file path')
 @click.option('--min-age-hours', default=1, help='Minimum article age in hours')
 @click.option('--max-age-days', default=7, help='Maximum article age in days')
+@click.option('--use-db', is_flag=True, default=True, help='Save to database (default)')
+@click.option('--use-json', is_flag=True, help='Save to JSON file instead of database')
 @click.pass_context
-def fetch_articles(ctx, count, output, min_age_hours, max_age_days):
+def fetch_articles(ctx, count, output, min_age_hours, max_age_days, use_db, use_json):
     """Fetch top articles from tech blogs"""
     click.echo(f"Fetching top {count} AI/ML articles...")
     
@@ -177,18 +426,34 @@ def fetch_articles(ctx, count, output, min_age_hours, max_age_days):
         max_articles_per_feed=config.article_settings.get('max_articles_per_feed', 20)
     )
     
+    # Determine storage method
+    save_to_db = use_db and not use_json
+    db_session = None
+    
+    if save_to_db:
+        from src.database import get_session, init_db
+        init_db()
+        db_session = get_session()
+    
     # Fetch articles
     articles = article_fetcher.get_top_articles(
         count=count,
         min_age_hours=min_age_hours,
-        max_age_days=max_age_days
+        max_age_days=max_age_days,
+        db_session=db_session
     )
     
-    # Save to file
-    save_json(articles, output)
+    # Save to JSON if requested or if not using database
+    if use_json or not save_to_db:
+        save_json(articles, output)
+        click.echo(f"✓ Saved to {output}")
+    
+    if save_to_db:
+        click.echo(f"✓ Saved to database")
+        if db_session:
+            db_session.close()
     
     click.echo(f"\n✓ Fetched {len(articles)} articles")
-    click.echo(f"✓ Saved to {output}")
     
     # Display preview
     click.echo("\nTop articles:")
@@ -203,39 +468,81 @@ def fetch_articles(ctx, count, output, min_age_hours, max_age_days):
 @click.option('--file', '-f', default='output/articles.json', help='Input file with articles')
 @click.option('--output', '-o', default='output/comments.json', help='Output file path')
 @click.option('--temperature', '-t', default=0.7, help='Sampling temperature')
+@click.option('--use-db', is_flag=True, default=True, help='Save to database (default)')
+@click.option('--use-json', is_flag=True, help='Save to JSON file instead of database')
 @click.pass_context
-def generate_comments(ctx, file, output, temperature):
+def generate_comments(ctx, file, output, temperature, use_db, use_json):
     """Generate comments for articles"""
     click.echo(f"Generating comments for articles...")
     
     config = ctx.obj['config']
     
     # Load articles
+    articles = []
     try:
         articles = load_json(file)
     except FileNotFoundError:
-        click.echo(f"Error: File not found: {file}", err=True)
+        # Try loading from database if file not found
+        if use_db and not use_json:
+            from src.database import get_session, init_db, Article
+            init_db()
+            db_session = get_session()
+            db_articles = db_session.query(Article).order_by(Article.fetched_at.desc()).limit(10).all()
+            articles = [{
+                'id': a.id,
+                'title': a.title,
+                'url': a.url,
+                'summary': a.summary,
+                'source': a.source
+            } for a in db_articles]
+            db_session.close()
+        else:
+            click.echo(f"Error: File not found: {file}", err=True)
+            sys.exit(1)
+    
+    if not articles:
+        click.echo("No articles found", err=True)
         sys.exit(1)
     
     # Initialize clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
-    
+
     # Initialize comment generator
     max_length = config.comment_settings.get('max_length', 300)
     comment_generator = CommentGenerator(openrouter_client, notion_client, max_length)
     
+    # Determine storage method
+    save_to_db = use_db and not use_json
+    db_session = None
+    
+    if save_to_db:
+        from src.database import get_session, init_db
+        init_db()
+        db_session = get_session()
+    
     # Generate comments
     articles_with_comments = comment_generator.generate_comments(
         articles=articles,
-        temperature=temperature
+        temperature=temperature,
+        db_session=db_session
     )
     
-    # Save to file
-    save_json(articles_with_comments, output)
+    # Save to JSON if requested or if not using database
+    if use_json or not save_to_db:
+        save_json(articles_with_comments, output)
+        click.echo(f"✓ Saved to {output}")
+    
+    if save_to_db:
+        click.echo(f"✓ Saved to database")
+        if db_session:
+            db_session.close()
     
     click.echo(f"\n✓ Generated comments for {len(articles_with_comments)} articles")
-    click.echo(f"✓ Saved to {output}")
     
     # Display preview
     click.echo("\nPreview of generated comments:")
@@ -270,13 +577,17 @@ def post_comments(ctx, file, index, preview):
         sys.exit(1)
     
     # Initialize clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
     mastodon_client = MastodonClient(
         config.mastodon_access_token,
         config.mastodon_api_base_url
     )
-    
+
     max_length = config.comment_settings.get('max_length', 300)
     comment_generator = CommentGenerator(openrouter_client, notion_client, max_length)
     
@@ -438,9 +749,13 @@ def search_and_reply(ctx, keyword, count, output, post_replies):
         click.echo(f"   URL: {post['url']}")
     
     # Initialize AI clients
-    notion_client = NotionClient(config.notion_api_key, config.notion_page_id)
+    notion_client = NotionClient(
+        config.notion_api_key,
+        config.notion_page_id or "",
+        database_id=getattr(config, 'notion_database_id', None),
+    )
     openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
-    
+
     # Generate replies using structured outputs
     click.echo(f"\n🤖 Generating replies using AI structured outputs...")
     
@@ -506,6 +821,256 @@ def search_and_reply(ctx, keyword, count, output, post_replies):
     
     else:
         click.echo(f"\n✗ No relevant posts to reply to")
+
+
+@cli.command()
+@click.option('--style', '-s', default='professional', help='Post style')
+@click.option('--temperature', '-t', default=0.7, help='Sampling temperature')
+@click.option('--max-articles', '-a', default=3, help='Maximum articles to use')
+@click.pass_context
+def generate_pending_post(ctx, style, temperature, max_articles):
+    """Generate a post with news and queue for Telegram approval"""
+    click.echo("Generating post with news for approval...")
+    
+    config = ctx.obj['config']
+    
+    # Validate Telegram configuration
+    if not config.telegram_bot_token or not config.telegram_chat_id:
+        click.echo("Error: Telegram bot token and chat ID must be set", err=True)
+        click.echo("Set TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID environment variables", err=True)
+        sys.exit(1)
+    
+    try:
+        # Initialize database
+        init_db()
+        db_session = get_session()
+        
+        # Initialize clients
+        notion_client = NotionClient(
+            config.notion_api_key,
+            config.notion_page_id or "",
+            database_id=getattr(config, 'notion_database_id', None),
+        )
+        openrouter_client = OpenrouterClient(config.openrouter_api_key, config.openrouter_model)
+        mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
+
+        # Initialize article fetcher
+        article_fetcher = ArticleFetcher(
+            rss_feeds=config.rss_feeds,
+            keywords=config.article_keywords,
+            max_articles_per_feed=config.article_settings.get('max_articles_per_feed', 20)
+        )
+        
+        max_length = config.post_settings.get('max_length', 500)
+        rag_retriever = RAGRetriever() if (RAG_AVAILABLE and RAGRetriever) else None
+        enhanced_generator = EnhancedPostGenerator(
+            notion_client, openrouter_client, article_fetcher, max_length,
+            rag_retriever=rag_retriever,
+        )
+        
+        # Initialize logo handler
+        logo_settings = config.logo_settings
+        logo_handler = LogoHandler(
+            logo_directory=logo_settings.get('directory', 'assets/logos'),
+            default_logo=logo_settings.get('default_logo')
+        )
+        
+        # Initialize Telegram bot
+        telegram_settings = config.telegram_settings
+        telegram_bot = TelegramBot(
+            bot_token=config.telegram_bot_token,
+            approval_chat_id=config.telegram_chat_id
+        )
+        
+        # Initialize approval workflow
+        approval_workflow = ApprovalWorkflow(
+            telegram_bot=telegram_bot,
+            mastodon_client=mastodon_client,
+            logo_handler=logo_handler,
+            approval_timeout_hours=telegram_settings.get('approval_timeout_hours', 24)
+        )
+        
+        # Initialize image generator if available and enabled
+        image_generator = None
+        if REPLICATE_AVAILABLE and config.replicate_api_token:
+            image_gen_settings = config.image_generation_settings
+            if image_gen_settings.get('enabled', True):
+                try:
+                    image_generator = ReplicateImageGenerator(
+                        replicate_api_token=config.replicate_api_token,
+                        openrouter_client=openrouter_client,
+                        model=image_gen_settings.get('replicate_model', 'sundai-club/truststacksocial:b897202db67596183259c5dfaa424ddeb898cc5923934fe8afdd8e096c721517'),
+                        trigger_word=image_gen_settings.get('trigger_word', 'truststack'),
+                        model_type=image_gen_settings.get('model_type', 'schnell'),
+                        num_inference_steps=image_gen_settings.get('num_inference_steps', 4),
+                        guidance_scale=image_gen_settings.get('guidance_scale', 7.5),
+                        style_suffix=image_gen_settings.get('style_suffix', 'cartoonish style, pastel colors'),
+                        image_directory=image_gen_settings.get('image_directory', 'assets/generated_images')
+                    )
+                    logger.info("Initialized ReplicateImageGenerator")
+                except Exception as e:
+                    logger.warning(f"Failed to initialize ReplicateImageGenerator: {e}")
+                    image_generator = None
+            else:
+                logger.info("Image generation is disabled in config")
+        else:
+            if not REPLICATE_AVAILABLE:
+                logger.info("ReplicateImageGenerator not available (replicate package not installed)")
+            elif not config.replicate_api_token:
+                logger.info("REPLICATE_API_TOKEN not set, skipping image generation")
+        
+        # Initialize manual post generator
+        manual_generator = ManualPostGenerator(
+            enhanced_generator, approval_workflow, logo_handler, image_generator
+        )
+        
+        # Generate and queue post
+        result = manual_generator.generate_and_queue_post(
+            style=style,
+            temperature=temperature,
+            max_articles=max_articles,
+            db_session=db_session
+        )
+        
+        db_session.close()
+        
+        if result.get('success'):
+            click.echo(f"\n✓ Generated and queued post for approval!")
+            click.echo(f"  Pending Post ID: {result['pending_post_id']}")
+            click.echo(f"  Style: {result['style']}")
+            click.echo(f"  Articles used: {result['articles_used']}")
+            click.echo(f"  Quotes included: {result['quotes_used']}")
+            click.echo(f"  Has logo: {result['has_logo']}")
+            click.echo(f"  Has comic image: {result.get('has_comic_image', False)}")
+            click.echo(f"\nCheck Telegram for approval request.")
+        else:
+            click.echo(f"\n✗ Error: {result.get('error', 'Unknown error')}", err=True)
+            sys.exit(1)
+            
+    except Exception as e:
+        click.echo(f"Error: {e}", err=True)
+        sys.exit(1)
+
+
+@cli.command()
+@click.option('--status', '-s', help='Filter by status (pending, approved, rejected, archived)')
+@click.pass_context
+def list_pending_posts(ctx, status):
+    """List pending posts awaiting approval"""
+    init_db()
+    db_session = get_session()
+    
+    try:
+        query = db_session.query(PendingPost)
+        
+        if status:
+            query = query.filter(PendingPost.status == status)
+        else:
+            query = query.filter(PendingPost.status == "pending")
+        
+        pending_posts = query.order_by(PendingPost.generated_at.desc()).all()
+        
+        if not pending_posts:
+            click.echo("No pending posts found.")
+            return
+        
+        click.echo(f"\nFound {len(pending_posts)} pending post(s):\n")
+        
+        for post in pending_posts:
+            click.echo(f"ID: {post.id}")
+            click.echo(f"Status: {post.status}")
+            click.echo(f"Style: {post.style}")
+            click.echo(f"Generated: {post.generated_at}")
+            click.echo(f"Content: {post.content[:100]}...")
+            click.echo(f"Articles: {len(post.news_context or [])}")
+            click.echo(f"Quotes: {len(post.news_quotes or [])}")
+            click.echo("-" * 60)
+            
+    finally:
+        db_session.close()
+
+
+@cli.command()
+@click.argument('post_id', type=int)
+@click.pass_context
+def approve_post(ctx, post_id):
+    """Approve a pending post manually (CLI fallback)"""
+    config = ctx.obj['config']
+    
+    init_db()
+    db_session = get_session()
+    
+    try:
+        # Initialize clients
+        mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
+        logo_handler = LogoHandler(
+            logo_directory=config.logo_settings.get('directory', 'assets/logos')
+        )
+        telegram_bot = TelegramBot(
+            bot_token=config.telegram_bot_token or "",
+            approval_chat_id=config.telegram_chat_id or ""
+        )
+        
+        approval_workflow = ApprovalWorkflow(
+            telegram_bot=telegram_bot,
+            mastodon_client=mastodon_client,
+            logo_handler=logo_handler
+        )
+        
+        success = approval_workflow.process_approval(post_id, db_session=db_session)
+        
+        if success:
+            click.echo(f"✓ Approved and posted pending post {post_id}")
+        else:
+            click.echo(f"✗ Failed to approve post {post_id}", err=True)
+            sys.exit(1)
+            
+    finally:
+        db_session.close()
+
+
+@cli.command()
+@click.argument('post_id', type=int)
+@click.option('--reason', '-r', help='Rejection reason')
+@click.pass_context
+def reject_post(ctx, post_id, reason):
+    """Reject a pending post manually (CLI fallback)"""
+    config = ctx.obj['config']
+    
+    init_db()
+    db_session = get_session()
+    
+    try:
+        # Initialize clients
+        mastodon_client = MastodonClient(config.mastodon_access_token, config.mastodon_api_base_url)
+        logo_handler = LogoHandler(
+            logo_directory=config.logo_settings.get('directory', 'assets/logos')
+        )
+        telegram_bot = TelegramBot(
+            bot_token=config.telegram_bot_token or "",
+            approval_chat_id=config.telegram_chat_id or ""
+        )
+        
+        approval_workflow = ApprovalWorkflow(
+            telegram_bot=telegram_bot,
+            mastodon_client=mastodon_client,
+            logo_handler=logo_handler
+        )
+        
+        success = approval_workflow.process_rejection(
+            post_id,
+            rejection_reason=reason,
+            db_session=db_session
+        )
+        
+        if success:
+            click.echo(f"✓ Rejected and archived pending post {post_id}")
+        else:
+            click.echo(f"✗ Failed to reject post {post_id}", err=True)
+            sys.exit(1)
+            
+    finally:
+        db_session.close()
 
 
 if __name__ == '__main__':

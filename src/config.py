@@ -35,10 +35,18 @@ class Config:
         # Notion
         self.notion_api_key = os.getenv('NOTION_API_KEY')
         self.notion_page_id = os.getenv('NOTION_PAGE_ID')
+        self.notion_database_id = os.getenv('NOTION_DATABASE_ID')  # Optional: for RAG multi-doc fetch
         
         # Mastodon
         self.mastodon_access_token = os.getenv('MASTODON_ACCESS_TOKEN')
         self.mastodon_api_base_url = os.getenv('MASTODON_API_BASE_URL', 'https://mastodon.social')
+        
+        # Telegram
+        self.telegram_bot_token = os.getenv('TELEGRAM_BOT_TOKEN')
+        self.telegram_chat_id = os.getenv('TELEGRAM_CHAT_ID')
+        
+        # Replicate
+        self.replicate_api_token = os.getenv('REPLICATE_API_TOKEN')
     
     def get(self, key: str, default: Any = None) -> Any:
         """Get configuration value by key"""
@@ -76,6 +84,26 @@ class Config:
         """Get comment generation settings"""
         return self.get('comment_settings', {})
     
+    @property
+    def logo_settings(self) -> Dict[str, Any]:
+        """Get logo configuration"""
+        return self.get('logos', {})
+    
+    @property
+    def telegram_settings(self) -> Dict[str, Any]:
+        """Get Telegram bot configuration"""
+        return self.get('telegram', {})
+    
+    @property
+    def post_generation_settings(self) -> Dict[str, Any]:
+        """Get post generation settings"""
+        return self.get('post_generation', {})
+    
+    @property
+    def image_generation_settings(self) -> Dict[str, Any]:
+        """Get image generation configuration"""
+        return self.get('image_generation', {})
+    
     def validate(self) -> list:
         """Validate required configuration values"""
         errors = []
@@ -86,8 +114,8 @@ class Config:
         if not self.notion_api_key:
             errors.append("NOTION_API_KEY not set")
         
-        if not self.notion_page_id:
-            errors.append("NOTION_PAGE_ID not set")
+        if not self.notion_page_id and not self.notion_database_id:
+            errors.append("NOTION_PAGE_ID or NOTION_DATABASE_ID must be set")
         
         if not self.mastodon_access_token:
             errors.append("MASTODON_ACCESS_TOKEN not set")

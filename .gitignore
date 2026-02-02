@@ -23,6 +23,10 @@ ENV/
 output/*.json
 output/*.csv
 
+# Local data and generated assets
+data/
+assets/generated_images/
+
 # Logs
 *.log
 logs/

@@ -2,8 +2,20 @@
 Openrouter API client for LLM interactions
 """
 import logging
+import os
 from typing import Dict, Any, Optional, List
 from openai import OpenAI
+
+
+class NoLLMError(Exception):
+    """Raised when NO_LLM=1 and no OpenRouter call should be made."""
+    pass
+
+# Note: IPv4 forcing is handled at socket level in main.py
+# httpx (used by OpenAI library) will inherit IPv4-only behavior
+
+# Global cap to avoid 402 Payment Required; leave headroom below account limit
+MAX_TOKENS = 80
 
 logger = logging.getLogger(__name__)
 
@@ -32,20 +44,29 @@ class OpenrouterClient:
         prompt: str,
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 1000
+        max_tokens: Optional[int] = None
     ) -> str:
         """
-        Generate completion from Openrouter
+        Generate completion from Openrouter.
+        Uses global MAX_TOKENS unless caller passes a lower max_tokens (e.g. for minimal token usage).
         
         Args:
             prompt: User prompt
             system_prompt: Optional system prompt
             temperature: Sampling temperature
-            max_tokens: Maximum tokens to generate
+            max_tokens: Optional; if set and <= MAX_TOKENS, used for this call; else MAX_TOKENS
             
         Returns:
             Generated text
         """
+        if os.getenv("NO_LLM") == "1":
+            raise NoLLMError("NO_LLM enabled")
+        effective_max = (
+            min(max_tokens, MAX_TOKENS)
+            if (max_tokens is not None and max_tokens > 0)
+            else MAX_TOKENS
+        )
+        max_tokens = effective_max
         try:
             messages = []
             
@@ -84,16 +105,16 @@ class OpenrouterClient:
         prompts: List[str],
         system_prompt: Optional[str] = None,
         temperature: float = 0.7,
-        max_tokens: int = 1000
+        max_tokens: Optional[int] = None
     ) -> List[str]:
         """
-        Generate multiple completions
+        Generate multiple completions. Each call uses MAX_TOKENS.
         
         Args:
             prompts: List of prompts
             system_prompt: Optional system prompt
             temperature: Sampling temperature
-            max_tokens: Maximum tokens per completion
+            max_tokens: Ignored; MAX_TOKENS is used
             
         Returns:
             List of generated texts
@@ -105,8 +126,7 @@ class OpenrouterClient:
             result = self.generate_completion(
                 prompt=prompt,
                 system_prompt=system_prompt,
-                temperature=temperature,
-                max_tokens=max_tokens
+                temperature=temperature
             )
             results.append(result)
         
@@ -150,8 +170,7 @@ Post:"""
         return self.generate_completion(
             prompt=prompt,
             system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=300
+            temperature=temperature
         )
     
     def generate_article_comment(
@@ -197,7 +216,6 @@ Comment:"""
         return self.generate_completion(
             prompt=prompt,
             system_prompt=system_prompt,
-            temperature=temperature,
-            max_tokens=200
+            temperature=temperature
         )
 

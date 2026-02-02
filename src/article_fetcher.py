@@ -6,10 +6,16 @@ import feedparser
 from typing import List, Dict, Any, Optional
 from datetime import datetime, timedelta
 from urllib.parse import urlparse
+from sqlalchemy.orm import Session
 
 from .utils import extract_keywords, clean_text
 
 logger = logging.getLogger(__name__)
+
+# TrustStack-relevant keywords: prefer these when ranking so selected news is company-related
+COMPANY_KEYWORDS = frozenset({
+    "trust", "safety", "policy", "content moderation", "trust and safety",
+})
 
 
 class ArticleFetcher:
@@ -171,16 +177,23 @@ class ArticleFetcher:
         Returns:
             Top ranked articles
         """
-        # Sort by relevance score (descending) and date (descending)
+        def _company_boost(article: Dict[str, Any]) -> int:
+            matched = article.get("matched_keywords") or []
+            return sum(1 for kw in matched if kw.lower() in COMPANY_KEYWORDS)
+
+        # Combined score: relevance + extra weight for company-related keywords (trust & safety, policy, etc.)
+        def _sort_key(article: Dict[str, Any]):
+            relevance = article.get("relevance_score", 0)
+            boost = _company_boost(article)
+            combined = relevance + (2 * boost)  # company-related articles rank higher
+            return (combined, article.get("published_date") or datetime.min)
+
         sorted_articles = sorted(
             articles,
-            key=lambda x: (
-                x.get('relevance_score', 0),
-                x.get('published_date') or datetime.min
-            ),
-            reverse=True
+            key=_sort_key,
+            reverse=True,
         )
-        
+
         top_articles = sorted_articles[:top_n]
         logger.info(f"Selected top {len(top_articles)} articles")
         
@@ -191,7 +204,8 @@ class ArticleFetcher:
         count: int = 10,
         min_age_hours: int = 1,
         max_age_days: int = 7,
-        min_keywords: int = 1
+        min_keywords: int = 1,
+        db_session: Optional[Session] = None
     ) -> List[Dict[str, Any]]:
         """
         Fetch and return top articles
@@ -213,6 +227,40 @@ class ArticleFetcher:
         
         # Rank and return top N
         top = self.rank_articles(filtered, count)
+        
+        # Save to database if session provided
+        if db_session:
+            try:
+                from .database import Article
+                saved_count = 0
+                for article_data in top:
+                    # Check if article already exists
+                    existing = db_session.query(Article).filter(Article.url == article_data['url']).first()
+                    if not existing:
+                        db_article = Article(
+                            title=article_data['title'],
+                            url=article_data['url'],
+                            summary=article_data.get('summary'),
+                            source=article_data.get('source', 'Unknown'),
+                            published_date=article_data.get('published_date'),
+                            matched_keywords=article_data.get('matched_keywords', []),
+                            relevance_score=article_data.get('relevance_score', 0)
+                        )
+                        db_session.add(db_article)
+                        saved_count += 1
+                
+                if saved_count > 0:
+                    db_session.commit()
+                    logger.info(f"Saved {saved_count} new articles to database")
+                # Attach DB id to each returned article so downstream (e.g. articles_used) is populated
+                for article_data in top:
+                    db_article = db_session.query(Article).filter(Article.url == article_data['url']).first()
+                    if db_article:
+                        article_data['id'] = db_article.id
+            except Exception as e:
+                logger.warning(f"Failed to save articles to database: {e}")
+                if db_session:
+                    db_session.rollback()
         
         logger.info(f"Retrieved {len(top)} top articles")
         return top
